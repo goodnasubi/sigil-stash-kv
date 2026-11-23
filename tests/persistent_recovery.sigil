@@ -1,0 +1,392 @@
+module tests.persistent_recovery
+  targets server
+  trust none
+
+use db.iohook.act_crash;
+use db.iohook.act_fail_io;
+use db.iohook.act_torn;
+use db.iohook.io_fault;
+use stash.memory.Ttl;
+use stash.persistent.PersistentStore;
+use stash.persistent.StoreError;
+use stash.persistent.close_persistent;
+use stash.persistent.delete;
+use stash.persistent.get;
+use stash.persistent.is_stopped;
+use stash.persistent.open_persistent;
+use stash.persistent.ping;
+use stash.persistent.put;
+use tests.persistent_support.at_1000;
+use tests.persistent_support.at_1010;
+use tests.persistent_support.at_1050;
+use tests.persistent_support.at_1099;
+use tests.persistent_support.at_1100;
+use tests.persistent_support.bytes;
+use tests.persistent_support.db_id;
+use tests.persistent_support.fresh;
+use tests.persistent_support.remove_tree;
+use tests.persistent_support.same_byte;
+use tests.persistent_support.stored_row;
+use tests.persistent_support.unavailable;
+
+// ADR 0059 stage 2 interruption and recovery tests. "Restart" means close and reopen the directory, which runs the
+// core's WAL recovery. Faults are injected through the core's own I/O gate (db.iohook), never by touching pages.
+
+fn key_a() -> Bytes
+  intent "First test key."
+  requires none
+  ensures none
+  effects none
+{
+  return bytes(3, 65);
+}
+
+fn key_b() -> Bytes
+  intent "Second test key."
+  requires none
+  ensures none
+  effects none
+{
+  return bytes(3, 66);
+}
+
+fn reopen(store: PersistentStore, dir: &String) -> Result<PersistentStore, StoreError>
+  intent "Close the store and open the same directory again, which recovers from the WAL."
+  requires none
+  ensures none
+  effects fs
+{
+  close_persistent(store)?;
+  return open_persistent(dir.clone(), db_id(), false);
+}
+
+fn row_is(store: &mut PersistentStore, key: &Bytes, found: Bool, value: Int, deadline: Int) -> Bool
+  intent "True when the stored row of a key is absent (found false) or has exactly this value byte and deadline."
+  requires none
+  ensures none
+  effects fs
+{
+  match stored_row(&mut store, &key) {
+    Ok(r) => {
+      if !found {
+        return !r.found;
+      }
+      return r.found && same_byte(&r.value, value) && r.deadline == deadline;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+fn restart_keeps_values(dir: &String) -> Result<Int, StoreError>
+  intent "Acknowledged updates and deletions survive a restart, and the original deadline is not renewed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  put(&mut store, &key_a(), &bytes(1, 1), Ttl.Seconds(100), at_1000)?;
+  put(&mut store, &key_b(), &bytes(1, 2), Ttl.NoExpiry, unavailable)?;
+  put(&mut store, &key_b(), &bytes(1, 3), Ttl.NoExpiry, unavailable)?;
+  let mut again = reopen(store, &dir)?;
+  if !row_is(&mut again, &key_a(), true, 1, 1100) {
+    return Ok(101);
+  }
+  if !same_byte(&get(&mut again, &key_a(), at_1050)?.unwrap_or(Bytes.new()), 1) {
+    return Ok(102);
+  }
+  if !same_byte(&get(&mut again, &key_b(), unavailable)?.unwrap_or(Bytes.new()), 3) {
+    return Ok(103);
+  }
+  delete(&mut again, &key_b())?;
+  let mut third = reopen(again, &dir)?;
+  if get(&mut third, &key_b(), unavailable)?.is_some() {
+    return Ok(104);
+  }
+  // Reading in the middle of the TTL did not shorten or renew it.
+  if !row_is(&mut third, &key_a(), true, 1, 1100) {
+    return Ok(105);
+  }
+  close_persistent(third)?;
+  return Ok(0);
+}
+
+fn expired_across_restart(dir: &String) -> Result<Int, StoreError>
+  intent "A value whose deadline passed while the store was closed reads as absent after the restart."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  put(&mut store, &key_a(), &bytes(1, 1), Ttl.Seconds(100), at_1000)?;
+  let mut again = reopen(store, &dir)?;
+  // Still live one second before the deadline, in the same process that restarted.
+  if !same_byte(&get(&mut again, &key_a(), at_1099)?.unwrap_or(Bytes.new()), 1) {
+    return Ok(111);
+  }
+  let mut second = reopen(again, &dir)?;
+  // The expired row is only removed by a read, which does so within its own transaction.
+  if !row_is(&mut second, &key_a(), true, 1, 1100) {
+    return Ok(112);
+  }
+  if get(&mut second, &key_a(), at_1100)?.is_some() {
+    return Ok(113);
+  }
+  if !row_is(&mut second, &key_a(), false, 0, 0) {
+    return Ok(114);
+  }
+  let mut third = reopen(second, &dir)?;
+  if get(&mut third, &key_a(), at_1100)?.is_some() {
+    return Ok(115);
+  }
+  close_persistent(third)?;
+  return Ok(0);
+}
+
+fn lock_is_exclusive(dir: &String) -> Result<Int, StoreError>
+  intent "A second open of a directory that is already open is refused."
+  requires none
+  ensures none
+  effects fs
+{
+  let store = fresh(&dir, false)?;
+  match open_persistent(dir.clone(), db_id(), false) {
+    Ok(_) => {
+      return Ok(121);
+    }
+    Err(_) => {}
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn stopped_after_unknown_commit(dir: &String, step: Int) -> Result<Int, StoreError>
+  intent "A failed WAL write or sync stops the store with CommitUnknown; only a reopen recovers it."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  put(&mut store, &key_b(), &bytes(1, 9), Ttl.NoExpiry, unavailable)?;
+  store.database.io.step = 0;
+  store.database.io.faults.push(io_fault(step, act_fail_io(), 0));
+  match put(&mut store, &key_a(), &bytes(1, 1), Ttl.Seconds(100), at_1000) {
+    Err(StoreError.CommitUnknown) => {}
+    _ => {
+      return Ok(131);
+    }
+  }
+  if !is_stopped(&store) {
+    return Ok(132);
+  }
+  match get(&mut store, &key_b(), unavailable) {
+    Err(StoreError.Stopped) => {}
+    _ => {
+      return Ok(133);
+    }
+  }
+  match put(&mut store, &key_b(), &bytes(1, 8), Ttl.NoExpiry, unavailable) {
+    Err(StoreError.Stopped) => {}
+    _ => {
+      return Ok(134);
+    }
+  }
+  match delete(&mut store, &key_b()) {
+    Err(StoreError.Stopped) => {}
+    _ => {
+      return Ok(135);
+    }
+  }
+  ping()?;
+  let mut again = reopen(store, &dir)?;
+  if is_stopped(&again) {
+    return Ok(136);
+  }
+  // The unacknowledged update is wholly applied or wholly absent; the earlier acknowledged one is intact.
+  let applied = row_is(&mut again, &key_a(), true, 1, 1100);
+  let absent = row_is(&mut again, &key_a(), false, 0, 0);
+  if !applied && !absent {
+    return Ok(137);
+  }
+  if !row_is(&mut again, &key_b(), true, 9, -1) {
+    return Ok(138);
+  }
+  // Recovery restores a working store.
+  put(&mut again, &key_b(), &bytes(1, 7), Ttl.NoExpiry, unavailable)?;
+  if !same_byte(&get(&mut again, &key_b(), unavailable)?.unwrap_or(Bytes.new()), 7) {
+    return Ok(139);
+  }
+  close_persistent(again)?;
+  return Ok(0);
+}
+
+// Model of the interruption sweep. Four updates run in order; the expected rows after k of them are:
+//   0: nothing, 1: A=(1, 1100), 2: A=(2, 1210), 3: A=(2, 1210) and B=(3, no expiry), 4: B only.
+
+fn do_op(store: &mut PersistentStore, i: Int) -> Result<Int, StoreError>
+  intent "Run the i-th update of the sweep."
+  requires none
+  ensures none
+  effects fs
+{
+  if i == 0 {
+    put(&mut store, &key_a(), &bytes(1, 1), Ttl.Seconds(100), at_1000)?;
+  }
+  if i == 1 {
+    put(&mut store, &key_a(), &bytes(1, 2), Ttl.Seconds(200), at_1010)?;
+  }
+  if i == 2 {
+    put(&mut store, &key_b(), &bytes(1, 3), Ttl.NoExpiry, unavailable)?;
+  }
+  if i == 3 {
+    delete(&mut store, &key_a())?;
+  }
+  return Ok(0);
+}
+
+fn matches_after(store: &mut PersistentStore, k: Int) -> Bool
+  intent "True when both rows are exactly those expected after k updates."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut a_found = false;
+  let mut a_value = 0;
+  let mut a_deadline = 0;
+  if k == 1 {
+    a_found = true;
+    a_value = 1;
+    a_deadline = 1100;
+  }
+  if k == 2 || k == 3 {
+    a_found = true;
+    a_value = 2;
+    a_deadline = 1210;
+  }
+  let b_found = k == 3 || k == 4;
+  return row_is(&mut store, &key_a(), a_found, a_value, a_deadline) && row_is(&mut store, &key_b(), b_found, 3, -1);
+}
+
+fn count_steps(dir: &String) -> Result<Int, StoreError>
+  intent "Run the four updates without a fault and return how many I/O gates they passed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  store.database.io.step = 0;
+  let mut i = 0;
+  while i < 4 {
+    do_op(&mut store, i)?;
+    i = i + 1;
+  }
+  let steps = store.database.io.step;
+  close_persistent(store)?;
+  return Ok(steps);
+}
+
+fn run_fault(dir: &String, step: Int, act: Int, n: Int) -> Result<Int, StoreError>
+  intent "Inject one fault, stop at the first failure, restart, and compare both rows with the model."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  store.database.io.step = 0;
+  store.database.io.faults.push(io_fault(step, act, n));
+  let mut acked = 0;
+  let mut failed = false;
+  let mut i = 0;
+  while i < 4 && !failed {
+    match do_op(&mut store, i) {
+      Ok(_) => {
+        acked = acked + 1;
+      }
+      Err(StoreError.CommitUnknown) => {
+        failed = true;
+      }
+      Err(_) => {
+        return Ok(141);
+      }
+    }
+    i = i + 1;
+  }
+  if failed {
+    if !is_stopped(&store) {
+      return Ok(142);
+    }
+    match get(&mut store, &key_a(), unavailable) {
+      Err(StoreError.Stopped) => {}
+      _ => {
+        return Ok(143);
+      }
+    }
+  }
+  let mut again = reopen(store, &dir)?;
+  let mut good = matches_after(&mut again, acked);
+  if !good && failed {
+    good = matches_after(&mut again, acked + 1);
+  }
+  close_persistent(again)?;
+  if !good {
+    return Ok(144);
+  }
+  return Ok(0);
+}
+
+fn interruption_sweep(dir: &String) -> Result<Int, StoreError>
+  intent "Interrupt every I/O gate of the four updates three ways and check every restart state."
+  requires none
+  ensures none
+  effects fs
+{
+  let steps = count_steps(&dir)?;
+  if steps < 8 {
+    return Ok(151);
+  }
+  let mut step = 1;
+  while step <= steps {
+    let io_failure = run_fault(&dir, step, act_fail_io(), 0)?;
+    if io_failure != 0 {
+      return Ok(io_failure);
+    }
+    let crash = run_fault(&dir, step, act_crash(), 0)?;
+    if crash != 0 {
+      return Ok(crash);
+    }
+    let torn = run_fault(&dir, step, act_torn(), 40)?;
+    if torn != 0 {
+      return Ok(torn);
+    }
+    step = step + 1;
+  }
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "Return zero when every recovery check passes, or the failing check's code."
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_stash_kv_persistent_recovery";
+  let mut code = restart_keeps_values(&dir).unwrap_or(100);
+  if code == 0 {
+    code = expired_across_restart(&dir).unwrap_or(110);
+  }
+  if code == 0 {
+    code = lock_is_exclusive(&dir).unwrap_or(120);
+  }
+  if code == 0 {
+    code = stopped_after_unknown_commit(&dir, 1).unwrap_or(130);
+  }
+  if code == 0 {
+    code = stopped_after_unknown_commit(&dir, 2).unwrap_or(130);
+  }
+  if code == 0 {
+    code = interruption_sweep(&dir).unwrap_or(150);
+  }
+  remove_tree(&dir);
+  return code;
+}

@@ -12,17 +12,39 @@
 
 Sigil の ADR 参照版 `0c1c441e60933fadbe05e1c5c63b11bcf4ad4409` と ADR マージ版 `947815bfa367354dec99bd6308b8931949dec49c` を確認した。公開の `clock.unix_seconds()` は永続モード向けの UTC Unix 秒を返す。内部の `std.os.io.io_now()` はスケジューラ用で、利用者コードから公開時計として利用できず、内部の時計読み取りも取得失敗を値として返さない。この段の実装は時計を注入して検証する。実運用の時計アダプターには、取得失敗を型で返し、同一起点の非負ナノ秒を公開する Sigil 側の契約が必要になる。評価器での時刻・失敗注入とネイティブ側での単調時計取得を、その契約で扱えることが必要になる。
 
+## 永続アダプター（段 2）
+
+`stash.persistent` は [sigil-db 核](https://github.com/goodnasubi/sigil-db) の型付き関係 API とトランザクション API だけに依存する薄いアダプターで、段 1 と同じ操作契約（`get`、`put`（期限あり／なし）、`delete`、`ping`）を永続化で提供する。SQL・PostgreSQL 通信・DB サーバーの起動、内部ページ形式への直接アクセスは使わない。
+
+- 表 `kv(key Bytes 主キー, value Bytes, deadline Int)` の 1 行に値と絶対期限を置く。`deadline` は UTC Unix 秒で、`-1` は期限なし。1 操作が核の直列トランザクション 1 件なので、値と期限は必ず一緒に置き換わる。置換時は前の期限も置き換わる。
+- `open_persistent(dir, db_id, require_ttl)` はディレクトリを開き、核の復旧（WAL 再生）を終えてから返す。表は初回だけ作る。`db_id` は新しいディレクトリを作るときだけ使う 16 byte の識別子。`close_persistent` で排他ロックを手放す。同じディレクトリを同時に二重に開くことはできない。
+- エラーは `StoreError`。キー・値・TTL・時計の検査は段 1 の `KvError` をそのまま使い（`StoreError.Kv(..)`）、核が上限を超えたときは `Kv(Capacity)`、それ以外の核のエラーは種別名の `Db(..)` になる。
+- 更新の成功は、核が WAL の同期に成功して commit したあとにだけ返す。**`CommitUnknown`**（WAL の書き込み・同期の失敗）が出たら成否は不明で、そのストアは停止する。以後の `get`／`put`／`delete` は `StoreError.Stopped` を返し続け（`PING` は保存データに触れないので成功のまま）、`close_persistent` して開き直す（復旧）ことでだけ戻る。永続モードの障害でメモリ専用モードへ切り替わることはない。
+- 時計は注入する。期限付き PUT と期限付きキーの GET は渡されたコールバックから **UTC Unix 秒**を取る（永続モードは公開の `clock.unix_seconds()` に合わせる）。取得失敗（`ClockUnavailable`）と、同じストアでの逆行（`ClockRegressed`）、期限計算のあふれ（`DeadlineOverflow`）は型付きエラー。`now >= deadline` で期限切れ。期限切れの行は GET が同じトランザクションの中で削除してからキーなしを返すので、古い期限が新しい値を消すことはない。再起動をまたいでも期限は作り直さない。再起動をまたいで逆行しない時刻は運用の前提で、アダプターが検出するのは同じプロセス内の逆行だけ。
+- 段 1 の公開型 `Ttl`、`Ack`、`KvError` を再利用し、段 1 の `stash.memory` は変更しない。キー・行の上限検査は段 1 と同じ式を `stash.persistent` に持つ。
+- 試験の追加: `tests/persistent_contract.sigil`（段 1 と同じ操作契約）と `tests/persistent_recovery.sigil`（再起動後の成功済み更新と削除、期限を作り直さないこと、期限切れ後の再起動、排他ロック、`CommitUnknown` での停止と復旧、4 件の更新の全 I/O 関門を `EIO`・直前の死亡・torn write で中断して再起動後の値と期限の組を全有／全無で確認）。故障注入は核が公開している I/O 関門（`db.iohook`）だけを使う。
+
+## 固定版
+
+永続アダプターのビルドと試験は `deps/pins.env` の 2 つの完全なコミット SHA だけを使う。浮動する `main` は取得しない。
+
+| 部品 | リポジトリ | コミット |
+|---|---|---|
+| コンパイラと標準ライブラリ | `goodnasubi/sigil` | `947815bfa367354dec99bd6308b8931949dec49c` |
+| 核（`db/` のモジュール） | `goodnasubi/sigil-db` | `9483e36f08c35bfc62b3beeb008a531887506037` |
+
+`cargo test` は核のチェックアウトが固定 SHA そのもので、ローカルの変更がないことを確かめる。核は `SIGIL_DB_CORE`（既定は `.deps/sigil-db-core`）で指す。コンパイラはビルドしたものを `SIGIL` で指す。更新するときは `deps/pins.env` と `.github/workflows/ci.yml` の `ref` を一緒に変え、互換性・上限・復旧試験を再実行する（CI は両者の一致を検査する）。
+
 ## 検証
 
-Sigil の処理系と標準ライブラリは次のコミットを使う。Cargo は Sigil のテスト起動に使用する。
+Sigil の処理系と標準ライブラリ、sigil-db 核は `deps/pins.env` のコミットを使う。Cargo は Sigil のテスト起動に使用する。
 
 ```sh
-git clone https://github.com/goodnasubi/sigil.git /tmp/sigil-stash-kv-compiler
-git -C /tmp/sigil-stash-kv-compiler checkout --detach 947815bfa367354dec99bd6308b8931949dec49c
-cargo build --locked --manifest-path /tmp/sigil-stash-kv-compiler/Cargo.toml
+scripts/fetch-deps.sh                      # .deps/ に固定コミットを取得し、一致を検査する
+cargo build --release --locked --manifest-path .deps/sigil-compiler/Cargo.toml
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-SIGIL=/tmp/sigil-stash-kv-compiler/target/debug/sigil cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+SIGIL="$PWD/.deps/sigil-compiler/target/release/sigil" cargo test --locked
 ```
 
-`cargo test` は Sigil の整形・型検査を行い、固定時刻を用いる同じ契約試験を評価器とネイティブ実行で検証する。
+`cargo test` は Sigil の整形・型検査を行い、段 1 は固定時刻を用いる契約試験を、段 2 は上の契約試験と中断・復旧試験を、評価器とネイティブ実行の両方で検証する。

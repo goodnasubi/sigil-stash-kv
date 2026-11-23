@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -40,8 +40,23 @@ jobs:
           path: sigil-compiler
           persist-credentials: false
 
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil-db
+          ref: 9483e36f08c35bfc62b3beeb008a531887506037
+          path: sigil-db-core
+          persist-credentials: false
+
+      - name: Verify the pinned compiler and core
+        run: |
+          . deps/pins.env
+          test "$(git -C sigil-compiler rev-parse HEAD)" = "$SIGIL_COMPILER_SHA"
+          test "$(git -C sigil-db-core rev-parse HEAD)" = "$SIGIL_DB_CORE_SHA"
+          echo "compiler $SIGIL_COMPILER_SHA"
+          echo "core     $SIGIL_DB_CORE_SHA"
+
       - name: Build Sigil
-        run: cargo build --locked --manifest-path sigil-compiler/Cargo.toml --target-dir "$RUNNER_TEMP/sigil-target"
+        run: cargo build --release --locked --manifest-path sigil-compiler/Cargo.toml --target-dir "$RUNNER_TEMP/sigil-target"
 
       - name: Test (Sigil evaluator and native)
-        run: SIGIL="$RUNNER_TEMP/sigil-target/debug/sigil" cargo test --locked
+        run: SIGIL="$RUNNER_TEMP/sigil-target/release/sigil" SIGIL_DB_CORE="$GITHUB_WORKSPACE/sigil-db-core" cargo test --locked
