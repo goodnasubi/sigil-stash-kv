@@ -1,0 +1,317 @@
+module tests.persistent_contract
+  targets server
+  trust none
+
+use stash.memory.KvError;
+use stash.memory.Ttl;
+use stash.persistent.PersistentStore;
+use stash.persistent.StoreError;
+use stash.persistent.close_persistent;
+use stash.persistent.delete;
+use stash.persistent.get;
+use stash.persistent.ping;
+use stash.persistent.put;
+use tests.persistent_support.at_1000;
+use tests.persistent_support.at_1001;
+use tests.persistent_support.at_1002;
+use tests.persistent_support.bytes;
+use tests.persistent_support.fresh;
+use tests.persistent_support.remove_tree;
+use tests.persistent_support.same_byte;
+use tests.persistent_support.stored_row;
+use tests.persistent_support.unavailable;
+
+// Stage 1 operation contract, run against the persistent adapter. TTLs are whole seconds and the clock returns
+// UTC Unix seconds, so a one second TTL set at 1000 expires at 1001.
+
+fn row_present(store: &mut PersistentStore, key: &Bytes) -> Bool
+  intent "True when the core still holds a row for the key (expired or not)."
+  requires none
+  ensures none
+  effects fs
+{
+  return match stored_row(&mut store, &key) {
+    Ok(r) => r.found,
+    Err(_) => false,
+  };
+}
+
+fn expiry_get_then_put(dir: &String) -> Result<Int, StoreError>
+  intent "Check expiry at the exact deadline, deletion of the expired row by the read, and reuse of the key."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  let key = bytes(1, 255);
+  let previous = bytes(1, 0);
+  let fresh_value = bytes(1, 128);
+  put(&mut store, &key, &previous, Ttl.Seconds(1), at_1000)?;
+  if !same_byte(&get(&mut store, &key, at_1000)?.unwrap_or(Bytes.new()), 0) {
+    return Ok(11);
+  }
+  // The expired row stays until a read, and the read at the deadline removes it.
+  if !row_present(&mut store, &key) {
+    return Ok(18);
+  }
+  if get(&mut store, &key, at_1001)?.is_some() {
+    return Ok(12);
+  }
+  if row_present(&mut store, &key) {
+    return Ok(19);
+  }
+  let other = bytes(1, 254);
+  put(&mut store, &other, &previous, Ttl.NoExpiry, unavailable)?;
+  delete(&mut store, &other)?;
+  put(&mut store, &key, &fresh_value, Ttl.Seconds(1), at_1001)?;
+  if !same_byte(&get(&mut store, &key, at_1001)?.unwrap_or(Bytes.new()), 128) {
+    return Ok(13);
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn expiry_put_then_get(dir: &String) -> Result<Int, StoreError>
+  intent "Check that a replacement made before a read is not removed by the previous deadline."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  let key = bytes(1, 255);
+  let previous = bytes(1, 0);
+  let fresh_value = bytes(1, 128);
+  put(&mut store, &key, &previous, Ttl.Seconds(1), at_1000)?;
+  put(&mut store, &key, &fresh_value, Ttl.Seconds(1), at_1001)?;
+  if !same_byte(&get(&mut store, &key, at_1001)?.unwrap_or(Bytes.new()), 128) {
+    return Ok(16);
+  }
+  if get(&mut store, &key, at_1002)?.is_some() {
+    return Ok(17);
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn without_expiry(dir: &String) -> Result<Int, StoreError>
+  intent "Check removal of a former deadline, delete of present and absent keys, and PING."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  let key = bytes(1, 255);
+  let previous = bytes(1, 0);
+  let fresh_value = bytes(1, 128);
+  put(&mut store, &key, &previous, Ttl.Seconds(1), at_1000)?;
+  put(&mut store, &key, &fresh_value, Ttl.NoExpiry, unavailable)?;
+  if !same_byte(&get(&mut store, &key, at_1002)?.unwrap_or(Bytes.new()), 128) {
+    return Ok(14);
+  }
+  delete(&mut store, &key)?;
+  delete(&mut store, &key)?;
+  if get(&mut store, &key, unavailable)?.is_some() {
+    return Ok(15);
+  }
+  ping()?;
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn rejected_replacements(dir: &String) -> Result<Int, StoreError>
+  intent "Check that rejected TTL and clock operations preserve both the current value and its deadline."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, true)?;
+  let key = bytes(1, 0);
+  let previous = bytes(1, 42);
+  let fresh_value = bytes(1, 99);
+  put(&mut store, &key, &previous, Ttl.Seconds(2), at_1000)?;
+  match put(&mut store, &key, &fresh_value, Ttl.NoExpiry, unavailable) {
+    Err(StoreError.Kv(KvError.TtlRequired)) => {}
+    _ => {
+      return Ok(21);
+    }
+  }
+  match put(&mut store, &key, &fresh_value, Ttl.Seconds(0), unavailable) {
+    Err(StoreError.Kv(KvError.InvalidTtl)) => {}
+    _ => {
+      return Ok(22);
+    }
+  }
+  match put(&mut store, &key, &fresh_value, Ttl.Seconds(9223372036854775807), at_1000) {
+    Err(StoreError.Kv(KvError.DeadlineOverflow)) => {}
+    _ => {
+      return Ok(23);
+    }
+  }
+  match put(&mut store, &key, &fresh_value, Ttl.Seconds(1), unavailable) {
+    Err(StoreError.Kv(KvError.ClockUnavailable)) => {}
+    _ => {
+      return Ok(24);
+    }
+  }
+  match get(&mut store, &key, unavailable) {
+    Err(StoreError.Kv(KvError.ClockUnavailable)) => {}
+    _ => {
+      return Ok(25);
+    }
+  }
+  if !same_byte(&get(&mut store, &key, at_1001)?.unwrap_or(Bytes.new()), 42) {
+    return Ok(26);
+  }
+  match get(&mut store, &key, at_1000) {
+    Err(StoreError.Kv(KvError.ClockRegressed)) => {}
+    _ => {
+      return Ok(27);
+    }
+  }
+  match put(&mut store, &key, &fresh_value, Ttl.Seconds(1), at_1000) {
+    Err(StoreError.Kv(KvError.ClockRegressed)) => {}
+    _ => {
+      return Ok(28);
+    }
+  }
+  // Every rejection above left the row as the first PUT wrote it.
+  match stored_row(&mut store, &key) {
+    Err(_) => {
+      return Ok(30);
+    }
+    Ok(stored) => {
+      if !stored.found || !same_byte(&stored.value, 42) || stored.deadline != 1002 {
+        return Ok(30);
+      }
+    }
+  }
+  if get(&mut store, &key, at_1002)?.is_some() {
+    return Ok(29);
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn limits(dir: &String) -> Result<Int, StoreError>
+  intent "Check public byte boundaries, empty values, and a row of the maximum encoded size."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  let key = bytes(512, 0);
+  let value = bytes(3072, 255);
+  let empty = Bytes.new();
+  put(&mut store, &key, &value, Ttl.Seconds(1), at_1000)?;
+  if get(&mut store, &key, at_1000)?.unwrap_or(Bytes.new()).byte_len() != 3072 {
+    return Ok(31);
+  }
+  match put(&mut store, &key, &bytes(3073, 255), Ttl.NoExpiry, unavailable) {
+    Err(StoreError.Kv(KvError.ValueLength)) => {}
+    _ => {
+      return Ok(32);
+    }
+  }
+  match get(&mut store, &empty, unavailable) {
+    Err(StoreError.Kv(KvError.KeyLength)) => {}
+    _ => {
+      return Ok(33);
+    }
+  }
+  match delete(&mut store, &bytes(513, 0)) {
+    Err(StoreError.Kv(KvError.KeyLength)) => {}
+    _ => {
+      return Ok(34);
+    }
+  }
+  // A second maximum-size key lives next to the first; rejected writes never evict a live key.
+  put(&mut store, &bytes(512, 1), &value, Ttl.NoExpiry, unavailable)?;
+  if get(&mut store, &key, at_1000)?.unwrap_or(Bytes.new()).byte_len() != 3072 {
+    return Ok(36);
+  }
+  put(&mut store, &key, &empty, Ttl.NoExpiry, unavailable)?;
+  match get(&mut store, &key, unavailable)? {
+    Some(v) => {
+      if v.byte_len() != 0 {
+        return Ok(37);
+      }
+    }
+    None => {
+      return Ok(38);
+    }
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+fn many_keys(dir: &String) -> Result<Int, StoreError>
+  intent "Check that many distinct keys, replacements and deletions stay consistent."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut store = fresh(&dir, false)?;
+  let mut i = 0;
+  while i < 60 {
+    let mut key = bytes(8, 0);
+    let _ = key.set(7, i);
+    put(&mut store, &key, &bytes(300, i), Ttl.NoExpiry, unavailable)?;
+    i = i + 1;
+  }
+  i = 0;
+  while i < 60 {
+    let mut key = bytes(8, 0);
+    let _ = key.set(7, i);
+    if i % 2 == 0 {
+      delete(&mut store, &key)?;
+    } else {
+      put(&mut store, &key, &bytes(1, i), Ttl.NoExpiry, unavailable)?;
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while i < 60 {
+    let mut key = bytes(8, 0);
+    let _ = key.set(7, i);
+    let got = get(&mut store, &key, unavailable)?;
+    if i % 2 == 0 {
+      if got.is_some() {
+        return Ok(41);
+      }
+    } else {
+      if !same_byte(&got.unwrap_or(Bytes.new()), i) {
+        return Ok(42);
+      }
+    }
+    i = i + 1;
+  }
+  close_persistent(store)?;
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "Return zero when every contract check passes, or the failing check's code."
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_stash_kv_persistent_contract";
+  let mut code = expiry_get_then_put(&dir).unwrap_or(10);
+  if code == 0 {
+    code = expiry_put_then_get(&dir).unwrap_or(15);
+  }
+  if code == 0 {
+    code = without_expiry(&dir).unwrap_or(20);
+  }
+  if code == 0 {
+    code = rejected_replacements(&dir).unwrap_or(40);
+  }
+  if code == 0 {
+    code = limits(&dir).unwrap_or(50);
+  }
+  if code == 0 {
+    code = many_keys(&dir).unwrap_or(60);
+  }
+  remove_tree(&dir);
+  return code;
+}

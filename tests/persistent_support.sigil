@@ -1,0 +1,213 @@
+module tests.persistent_support
+  targets server
+  trust none
+
+use db.database.begin_tx;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.relation.rel_get;
+use db.types.Value;
+use stash.persistent.PersistentStore;
+use stash.persistent.StoreError;
+use stash.persistent.open_persistent;
+
+pub struct Raw {
+  found: Bool,
+  value: Bytes,
+  deadline: Int,
+}
+
+pub fn bytes(size: Int, byte: Int) -> Bytes
+  intent "Build a binary fixture."
+  requires none
+  ensures none
+  effects none
+{
+  let mut fixture = Bytes.new();
+  let mut i = 0;
+  while i < size {
+    fixture.push(byte);
+    i = i + 1;
+  }
+  return fixture;
+}
+
+pub fn db_id() -> Bytes
+  intent "Fixed 16-byte database identifier for new test directories."
+  requires none
+  ensures none
+  effects none
+{
+  return bytes(16, 7);
+}
+
+pub fn at_1000() -> Option<Int>
+  intent "Clock reading of the first write."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1000);
+}
+
+pub fn at_1001() -> Option<Int>
+  intent "Clock reading one second after the first write."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1001);
+}
+
+pub fn at_1002() -> Option<Int>
+  intent "Clock reading two seconds after the first write."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1002);
+}
+
+pub fn at_1010() -> Option<Int>
+  intent "Clock reading ten seconds after the first write."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1010);
+}
+
+pub fn at_1050() -> Option<Int>
+  intent "Clock reading in the middle of a 100 second TTL set at 1000."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1050);
+}
+
+pub fn at_1099() -> Option<Int>
+  intent "Clock reading one second before the deadline of a 100 second TTL set at 1000."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1099);
+}
+
+pub fn at_1100() -> Option<Int>
+  intent "Clock reading at the deadline of a 100 second TTL set at 1000."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1100);
+}
+
+pub fn unavailable() -> Option<Int>
+  intent "Simulate a failing clock."
+  requires none
+  ensures none
+  effects none
+{
+  return None;
+}
+
+pub fn remove_tree(dir: &String)
+  intent "Remove the regular files of a test directory and the directory itself."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut names = List.new();
+  match fs.open_dir(&Path.new(&dir)) {
+    Err(_) => {
+      return;
+    }
+    Ok(d) => {
+      match d.read_entries(64) {
+        Err(_) => {}
+        Ok(entries) => {
+          let mut i = 0;
+          while i < entries.len() {
+            match entries.get(i) {
+              None => {}
+              Some(e) => {
+                names.push(e.name());
+              }
+            }
+            i = i + 1;
+          }
+        }
+      }
+      let _ = d.close();
+    }
+  }
+  let mut k = 0;
+  while k < names.len() {
+    match names.get(k) {
+      None => {}
+      Some(n) => {
+        let mut path = dir.as_bytes();
+        path.push(47);
+        path.extend(&n.as_bytes());
+        let _ = fs.remove_file(&Path.new(&path.to_string_utf8().unwrap_or("")));
+      }
+    }
+    k = k + 1;
+  }
+  let _ = fs.remove_dir(&Path.new(&dir));
+}
+
+pub fn fresh(dir: &String, require_ttl: Bool) -> Result<PersistentStore, StoreError>
+  intent "Open a store in an empty directory."
+  requires none
+  ensures none
+  effects fs
+{
+  remove_tree(&dir);
+  return open_persistent(dir.clone(), db_id(), require_ttl);
+}
+
+pub fn stored_row(store: &mut PersistentStore, key: &Bytes) -> Result<Raw, DbError>
+  intent "Read the stored row of a key through the core API, without the expiry rule."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut store.database)?;
+  let found = rel_get(&store.database, &mut tx, &"kv", &Value.BytesVal(key.clone()));
+  let _ = tx_rollback(&mut tx, &mut store.database);
+  let row = found?;
+  match row {
+    None => {
+      return Ok(Raw { found: false, value: Bytes.new(), deadline: 0 });
+    }
+    Some(r) => {
+      let mut value = Bytes.new();
+      let mut deadline = 0;
+      match r.get(1) {
+        Some(Value.BytesVal(b)) => {
+          value = b.clone();
+        }
+        _ => {}
+      }
+      match r.get(2) {
+        Some(Value.IntVal(d)) => {
+          deadline = d + 0;
+        }
+        _ => {}
+      }
+      return Ok(Raw { found: true, value: value, deadline: deadline });
+    }
+  }
+}
+
+pub fn same_byte(value: &Bytes, expected: Int) -> Bool
+  intent "True when the value is one byte equal to expected."
+  requires none
+  ensures none
+  effects none
+{
+  return value.byte_len() == 1 && value.get(0).unwrap_or(-1) == expected;
+}

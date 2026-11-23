@@ -1,0 +1,451 @@
+module stash.persistent
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.relation.column;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_get;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_table_exists;
+use db.types.Value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use stash.memory.Ack;
+use stash.memory.KvError;
+use stash.memory.Ttl;
+
+// ADR 0059 stage 2: persistent adapter over the pinned sigil-db core.
+//
+// One table `kv(key Bytes primary key, value Bytes, deadline Int)` holds the value and the absolute deadline in
+// one row (deadline -1 means no expiry; otherwise UTC Unix seconds). Every operation is one serial core
+// transaction, so a value and its deadline are always replaced together. The adapter depends only on the
+// public typed relation API (`rel_get`, `rel_insert`, `rel_replace`, `rel_delete`) and the transaction API.
+
+pub enum StoreError {
+  Kv(KvError),
+  Db(String),
+  CommitUnknown,
+  Stopped,
+}
+
+pub struct PersistentStore {
+  database: Database,
+  require_ttl: Bool,
+  last_now: Int,
+  stopped: Bool,
+}
+
+fn table() -> String
+  intent "Name of the single table that holds every key."
+  requires none
+  ensures none
+  effects none
+{
+  return "kv";
+}
+
+fn no_deadline() -> Int
+  intent "Deadline column value that represents a key without expiry."
+  requires none
+  ensures none
+  effects none
+{
+  return -1;
+}
+
+fn kv(error: KvError) -> StoreError
+  intent "Wrap a validation error shared with the in-memory store."
+  requires none
+  ensures none
+  effects none
+{
+  return StoreError.Kv(error);
+}
+
+fn map_db_error(store: &mut PersistentStore, error: &DbError) -> StoreError
+  intent "Translate a core error. CommitUnknown stops the store so the caller must close it and reopen for recovery."
+  requires none
+  ensures none
+  effects none
+{
+  let mut mapped = StoreError.Db(error_kind_name(&error));
+  match error {
+    DbError.CommitUnknown(_) => {
+      store.stopped = true;
+      mapped = StoreError.CommitUnknown;
+    }
+    DbError.Limit(_) => {
+      mapped = StoreError.Kv(KvError.Capacity);
+    }
+    _ => {}
+  }
+  return mapped;
+}
+
+fn open_core(dir: String, db_id: Bytes, require_ttl: Bool) -> Result<PersistentStore, StoreError>
+  intent "Open the core, which acquires its exclusive lock and runs recovery."
+  requires none
+  ensures none
+  effects fs
+{
+  return match open_database(dir, db_id) {
+    Ok(d) => Ok(PersistentStore { database: d, require_ttl: require_ttl, last_now: 0, stopped: false }),
+    Err(e) => Err(StoreError.Db(error_kind_name(&e))),
+  };
+}
+
+fn begin(store: &mut PersistentStore) -> Result<Tx, StoreError>
+  intent "Start the serial core transaction for one operation."
+  requires none
+  ensures none
+  effects fs
+{
+  return match begin_tx(&mut store.database) {
+    Ok(t) => Ok(t),
+    Err(e) => Err(map_db_error(&mut store, &e)),
+  };
+}
+
+fn fetch(store: &mut PersistentStore, tx: &mut Tx, key: &Bytes) -> Result<Option<List<Value>>, StoreError>
+  intent "Read the row of a key inside the operation's transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  return match rel_get(&store.database, &mut tx, &table(), &key_value(&key)) {
+    Ok(row) => Ok(row),
+    Err(e) => Err(abandon(&mut store, &mut tx, &e)),
+  };
+}
+
+fn ensure_table(store: &mut PersistentStore, tx: &mut Tx) -> Result<Ack, StoreError>
+  intent "Create the key table when the directory is new."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut exists = false;
+  match rel_table_exists(&store.database, &mut tx, &table()) {
+    Ok(found) => {
+      exists = found;
+    }
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  if exists {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Ok(Ack.Done);
+  }
+  let mut columns = List.new();
+  columns.push(column("key", tag_bytes()));
+  columns.push(column("value", tag_bytes()));
+  columns.push(column("deadline", tag_int()));
+  match rel_create_table(&store.database, &mut tx, &table(), &columns, &"key") {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  return commit(&mut store, &mut tx);
+}
+
+pub fn open_persistent(dir: String, db_id: Bytes, require_ttl: Bool) -> Result<PersistentStore, StoreError>
+  intent "Open the core in a directory, run its recovery, and create the key table on first use."
+  requires db_id.byte_len() == 16
+  ensures none
+  effects fs
+{
+  let mut store = open_core(dir, db_id, require_ttl)?;
+  let mut tx = begin(&mut store)?;
+  ensure_table(&mut store, &mut tx)?;
+  return Ok(store);
+}
+
+pub fn close_persistent(store: PersistentStore) -> Result<Ack, StoreError>
+  intent "Release the core's exclusive lock."
+  requires none
+  ensures none
+  effects fs
+{
+  match close_database(store.database) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(StoreError.Db(error_kind_name(&e)));
+    }
+  }
+  return Ok(Ack.Done);
+}
+
+pub fn is_stopped(store: &PersistentStore) -> Bool
+  intent "True once a commit outcome was unknown. Only close and reopen recover."
+  requires none
+  ensures none
+  effects none
+{
+  return store.stopped;
+}
+
+fn validate_key(key: &Bytes) -> Result<Ack, StoreError>
+  intent "Apply the public key limit and the encoded sigil-db key limit."
+  requires none
+  ensures none
+  effects none
+{
+  let size = key.byte_len();
+  if size < 1 || size > 512 {
+    return Err(kv(KvError.KeyLength));
+  }
+  if 5 + size > 1024 {
+    return Err(kv(KvError.EncodedKeyLength));
+  }
+  return Ok(Ack.Done);
+}
+
+fn validate_row(key: &Bytes, value: &Bytes) -> Result<Ack, StoreError>
+  intent "Apply the public value limit and the encoded sigil-db row limit."
+  requires none
+  ensures none
+  effects none
+{
+  if value.byte_len() > 3072 {
+    return Err(kv(KvError.ValueLength));
+  }
+  if 2 + (5 + key.byte_len()) + (5 + value.byte_len()) + 9 > 4096 {
+    return Err(kv(KvError.EncodedRowLength));
+  }
+  return Ok(Ack.Done);
+}
+
+fn read_now(store: &mut PersistentStore, sample_time: fn() -> Option<Int>) -> Result<Int, StoreError>
+  intent "Sample UTC Unix seconds and reject a failed or regressing clock."
+  requires none
+  ensures none
+  effects of(sample_time)
+{
+  let now = sample_time().unwrap_or(-1);
+  if now < 0 {
+    return Err(kv(KvError.ClockUnavailable));
+  }
+  if now < store.last_now {
+    return Err(kv(KvError.ClockRegressed));
+  }
+  store.last_now = now;
+  return Ok(now);
+}
+
+fn commit(store: &mut PersistentStore, tx: &mut Tx) -> Result<Ack, StoreError>
+  intent "Commit; success is reported only after the core synced its WAL. A failure that is not CommitUnknown rolls back."
+  requires none
+  ensures none
+  effects fs
+{
+  match tx_commit(&mut tx, &mut store.database) {
+    Ok(_) => {
+      return Ok(Ack.Done);
+    }
+    Err(e) => {
+      let mapped = map_db_error(&mut store, &e);
+      if !store.stopped {
+        let _ = tx_rollback(&mut tx, &mut store.database);
+      }
+      return Err(mapped);
+    }
+  }
+}
+
+fn abandon(store: &mut PersistentStore, tx: &mut Tx, error: &DbError) -> StoreError
+  intent "Roll the transaction back after a failed operation and translate the error."
+  requires none
+  ensures none
+  effects none
+{
+  let mapped = map_db_error(&mut store, &error);
+  if !store.stopped {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+  }
+  return mapped;
+}
+
+fn key_value(key: &Bytes) -> Value
+  intent "Primary key value for a binary key."
+  requires none
+  ensures none
+  effects none
+{
+  return Value.BytesVal(key.clone());
+}
+
+fn row_of(key: &Bytes, value: &Bytes, deadline: Int) -> List<Value>
+  intent "Row for one key: key, value and deadline."
+  requires none
+  ensures none
+  effects none
+{
+  let mut row = List.new();
+  row.push(Value.BytesVal(key.clone()));
+  row.push(Value.BytesVal(value.clone()));
+  row.push(Value.IntVal(deadline));
+  return row;
+}
+
+fn row_value(row: &List<Value>) -> Bytes
+  intent "Value column of a stored row."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(1) {
+    Some(Value.BytesVal(b)) => b.clone(),
+    _ => Bytes.new(),
+  };
+}
+
+fn row_deadline(row: &List<Value>) -> Int
+  intent "Deadline column of a stored row, -1 when the key has no expiry."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(2) {
+    Some(Value.IntVal(d)) => d + 0,
+    _ => -1,
+  };
+}
+
+pub fn get(store: &mut PersistentStore, key: &Bytes, sample_time: fn() -> Option<Int>) -> Result<Option<Bytes>, StoreError>
+  intent "Read a live value; an expired row is deleted in the same transaction and reads as absent."
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  validate_key(&key)?;
+  let mut tx = begin(&mut store)?;
+  let found = fetch(&mut store, &mut tx, &key)?;
+  if found.is_none() {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Ok(None);
+  }
+  let row = found.unwrap_or(List.new());
+  let value = row_value(&row);
+  let deadline = row_deadline(&row);
+  if deadline == no_deadline() {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Ok(Some(value));
+  }
+  let mut now = 0;
+  match read_now(&mut store, sample_time) {
+    Ok(n) => {
+      now = n;
+    }
+    Err(e) => {
+      let _ = tx_rollback(&mut tx, &mut store.database);
+      return Err(e);
+    }
+  }
+  if now < deadline {
+    let _ = tx_rollback(&mut tx, &mut store.database);
+    return Ok(Some(value));
+  }
+  match rel_delete(&store.database, &mut tx, &table(), &key_value(&key)) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  commit(&mut store, &mut tx)?;
+  return Ok(None);
+}
+
+pub fn put(store: &mut PersistentStore, key: &Bytes, value: &Bytes, ttl: Ttl, sample_time: fn() -> Option<Int>) -> Result<Ack, StoreError>
+  intent "Create or replace a value and its deadline in one transaction."
+  requires none
+  ensures none
+  effects of(sample_time), fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  validate_key(&key)?;
+  validate_row(&key, &value)?;
+  let mut deadline = no_deadline();
+  match ttl {
+    Ttl.NoExpiry => {
+      if store.require_ttl {
+        return Err(kv(KvError.TtlRequired));
+      }
+    }
+    Ttl.Seconds(seconds) => {
+      if seconds <= 0 {
+        return Err(kv(KvError.InvalidTtl));
+      }
+      let now = read_now(&mut store, sample_time)?;
+      if seconds > 9223372036854775807 - now {
+        return Err(kv(KvError.DeadlineOverflow));
+      }
+      deadline = now + seconds;
+    }
+  }
+  let mut tx = begin(&mut store)?;
+  let existing = fetch(&mut store, &mut tx, &key)?;
+  let row = row_of(&key, &value, deadline);
+  if existing.is_some() {
+    match rel_replace(&store.database, &mut tx, &table(), &row) {
+      Ok(_) => {}
+      Err(e) => {
+        return Err(abandon(&mut store, &mut tx, &e));
+      }
+    }
+  } else {
+    match rel_insert(&store.database, &mut tx, &table(), &row) {
+      Ok(_) => {}
+      Err(e) => {
+        return Err(abandon(&mut store, &mut tx, &e));
+      }
+    }
+  }
+  return commit(&mut store, &mut tx);
+}
+
+pub fn delete(store: &mut PersistentStore, key: &Bytes) -> Result<Ack, StoreError>
+  intent "Remove a key if present and succeed for an absent key. Success is reported after the commit is synced."
+  requires none
+  ensures none
+  effects fs
+{
+  if store.stopped {
+    return Err(StoreError.Stopped);
+  }
+  validate_key(&key)?;
+  let mut tx = begin(&mut store)?;
+  match rel_delete(&store.database, &mut tx, &table(), &key_value(&key)) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(abandon(&mut store, &mut tx, &e));
+    }
+  }
+  return commit(&mut store, &mut tx);
+}
+
+pub fn ping() -> Result<Ack, StoreError>
+  intent "Respond successfully without accessing store data."
+  requires none
+  ensures none
+  effects none
+{
+  return Ok(Ack.Done);
+}
