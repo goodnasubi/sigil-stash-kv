@@ -1,0 +1,206 @@
+module stash.server
+  targets server
+  trust none
+
+use stash.memory.MemoryStore;
+use stash.memory.delete;
+use stash.memory.get;
+use stash.memory.put;
+use stash.protocol.ProtoError;
+use stash.protocol.Request;
+use stash.protocol.Response;
+use stash.protocol.kv_error_code;
+use stash.protocol.read_request;
+use stash.protocol.write_response;
+
+fn empty_bytes() -> Bytes
+  intent "Return empty Bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return Bytes.new();
+}
+
+pub fn handle_request(store: &mut MemoryStore, req: Request, sample_time: fn() -> Option<Int>) -> Response
+  intent "Process one Request against a MemoryStore and return a Response. Never logs keys or values."
+  requires none
+  ensures none
+  effects of(sample_time)
+{
+  match req {
+    Request.Ping => {
+      return Response.Success;
+    }
+    Request.Get(key) => {
+      let res = get(&mut store, &key, sample_time);
+      return match res {
+        Ok(opt) => match opt {
+          Some(val) => Response.Value(val),
+          None => Response.NotFound,
+        },
+        Err(err) => Response.Error(kv_error_code(err), empty_bytes()),
+      };
+    }
+    Request.Put(key, val, ttl) => {
+      let res = put(&mut store, &key, &val, ttl, sample_time);
+      return match res {
+        Ok(_) => Response.Success,
+        Err(err) => Response.Error(kv_error_code(err), empty_bytes()),
+      };
+    }
+    Request.Delete(key) => {
+      let res = delete(&mut store, &key);
+      return match res {
+        Ok(_) => Response.Success,
+        Err(err) => Response.Error(kv_error_code(err), empty_bytes()),
+      };
+    }
+  }
+}
+
+pub fn serve_stream(stream: &TcpStream, store: &SyncShared<Lock<MemoryStore>>, sample_time: fn() -> Option<Int>)
+  intent "Serve requests on a single connection sequentially until EOF, fatal protocol error, or timeout."
+  requires none
+  ensures none
+  effects of(sample_time), clock, net.server, task
+{
+  while true {
+    // Read request with 5000 ms timeout.
+    let read_result = task.timeout(5000, || read_request(&stream));
+    let mut maybe_req = Err(ProtoError.Closed);
+    match read_result {
+      Some(r) => {
+        maybe_req = r;
+      }
+      None => {
+        // Read timeout: close connection.
+        return;
+      }
+    }
+    match maybe_req {
+      Err(ProtoError.Closed) => {
+        // Orderly disconnect.
+        return;
+      }
+      Err(ProtoError.InvalidLength) => {
+        // Fatal protocol error: unrecoverable frame length, drop connection immediately.
+        return;
+      }
+      Err(ProtoError.UnsupportedVersion) => {
+        // Fatal protocol error: unsupported version, drop connection immediately.
+        return;
+      }
+      Err(ProtoError.UnknownOp) => {
+        // Unknown operation: send ERROR response (code 1) and continue.
+        let resp = Response.Error(1, empty_bytes());
+        let _ = task.timeout(5000, || write_response(&stream, &resp));
+      }
+      Err(ProtoError.InvalidPayload) => {
+        // Invalid payload: send ERROR response (code 2) and continue.
+        let resp = Response.Error(2, empty_bytes());
+        let _ = task.timeout(5000, || write_response(&stream, &resp));
+      }
+      Err(ProtoError.Other) => {
+        return;
+      }
+      Ok(req) => {
+        let lk = store.borrow();
+        let mut resp = Response.Error(14, empty_bytes());
+        match lk.acquire() {
+          Ok(g0) => {
+            let mut g = g0;
+            resp = handle_request(g.get_mut(), req, sample_time);
+          }
+          Err(_) => {}
+        }
+        let write_result = task.timeout(5000, || write_response(&stream, &resp));
+        match write_result {
+          Some(Ok(_)) => {}
+          _ => {
+            // Write timeout or error: drop connection.
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn default_clock() -> Option<Int>
+  intent "Sample current UTC Unix nanoseconds using standard clock."
+  requires none
+  ensures none
+  effects clock
+{
+  return match clock.unix_seconds() {
+    Some(s) => Some(s * 1000000000),
+    None => None,
+  };
+}
+
+struct Connection {
+  stream: TcpStream,
+  capacity: CapacityPermit,
+  store: SyncShared<Lock<MemoryStore>>,
+}
+
+fn serve_connection(conn: &Connection)
+  intent "Serve requests on a single connection."
+  requires none
+  ensures none
+  effects clock, net.server, task
+{
+  serve_stream(&conn.stream, &conn.store, default_clock);
+}
+
+fn abort_connection(conn: Connection)
+  intent "Cleanup an aborted connection."
+  requires none
+  ensures none
+  effects none
+{}
+
+pub fn serve(listener: &TcpListener, capacity_limit: Int, store: SyncShared<Lock<MemoryStore>>) -> Result<Unit, NetError>
+  intent "Accept TCP connections up to capacity_limit and serve each connection."
+  requires none
+  ensures none
+  effects clock, net.server, task
+{
+  let maybe_cap = Capacity.new(capacity_limit);
+  return match maybe_cap {
+    Some(capacity) => task.roots_grace(capacity_limit, 1000, |group| {
+      while true {
+        match listener.accept() {
+          Ok(stream) => {
+            match capacity.try_acquire() {
+              Some(permit) => {
+                let slot = group.reserve();
+                let conn = Connection { stream: stream, capacity: permit, store: store.clone() };
+                slot.start(conn, serve_connection, abort_connection);
+              }
+              None => {
+                // Excess connections are dropped immediately.
+              }
+            }
+          }
+          Err(NetError.Closed) => {
+            return Ok(unit());
+          }
+          Err(_) => {
+            // Transient accept error (e.g. connection reset or file descriptor limit); continue accepting.
+          }
+        }
+      }
+      return Ok(unit());
+    }),
+    None => Err(NetError.Other),
+  };
+}
+
+fn unit()
+  intent "Return unit."
+  requires none
+  ensures none
+  effects none
+{}

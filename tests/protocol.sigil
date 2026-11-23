@@ -1,0 +1,400 @@
+module tests.protocol
+  targets server
+  trust none
+
+use stash.memory.Ack;
+use stash.memory.KvError;
+use stash.memory.Ttl;
+use stash.protocol.ProtoError;
+use stash.protocol.Request;
+use stash.protocol.Response;
+use stash.protocol.code_to_kv_error;
+use stash.protocol.encode_request;
+use stash.protocol.encode_response;
+use stash.protocol.kv_error_code;
+use stash.protocol.parse_request;
+use stash.protocol.parse_response;
+use stash.protocol.read_i64;
+
+fn bytes_eq(a: &Bytes, b: &Bytes) -> Bool
+  intent "Check whether two Bytes instances have identical contents."
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn test_request_roundtrip() -> Result<Ack, String>
+  intent "Test encoding and decoding of all Request variants."
+  requires none
+  ensures none
+  effects none
+{
+  // 1. Ping
+  let req_ping = Request.Ping;
+  let enc_ping = encode_request(&req_ping);
+  let payload_ping = enc_ping.slice(4, enc_ping.byte_len())?;
+  match parse_request(&payload_ping) {
+    Ok(Request.Ping) => {}
+    _ => {
+      return Err("ping roundtrip failed");
+    }
+  }
+
+  // 2. Get
+  let key = "my_key".as_bytes();
+  let req_get = Request.Get(key.clone());
+  let enc_get = encode_request(&req_get);
+  let payload_get = enc_get.slice(4, enc_get.byte_len())?;
+  match parse_request(&payload_get) {
+    Ok(Request.Get(k)) => {
+      if !bytes_eq(&k, &key) {
+        return Err("get key mismatch");
+      }
+    }
+    _ => {
+      return Err("get roundtrip failed");
+    }
+  }
+
+  // 3. Put NoExpiry
+  let val = "my_val".as_bytes();
+  let req_put1 = Request.Put(key.clone(), val.clone(), Ttl.NoExpiry);
+  let enc_put1 = encode_request(&req_put1);
+  let payload_put1 = enc_put1.slice(4, enc_put1.byte_len())?;
+  match parse_request(&payload_put1) {
+    Ok(Request.Put(k, v, Ttl.NoExpiry)) => {
+      if !bytes_eq(&k, &key) || !bytes_eq(&v, &val) {
+        return Err("put no_expiry content mismatch");
+      }
+    }
+    _ => {
+      return Err("put no_expiry roundtrip failed");
+    }
+  }
+
+  // 4. Put Seconds
+  let req_put2 = Request.Put(key.clone(), val.clone(), Ttl.Seconds(3600));
+  let enc_put2 = encode_request(&req_put2);
+  let payload_put2 = enc_put2.slice(4, enc_put2.byte_len())?;
+  match parse_request(&payload_put2) {
+    Ok(Request.Put(k, v, Ttl.Seconds(s))) => {
+      if !bytes_eq(&k, &key) || !bytes_eq(&v, &val) || s != 3600 {
+        return Err("put seconds content mismatch");
+      }
+    }
+    _ => {
+      return Err("put seconds roundtrip failed");
+    }
+  }
+
+  // 5. Delete
+  let req_del = Request.Delete(key.clone());
+  let enc_del = encode_request(&req_del);
+  let payload_del = enc_del.slice(4, enc_del.byte_len())?;
+  match parse_request(&payload_del) {
+    Ok(Request.Delete(k)) => {
+      if !bytes_eq(&k, &key) {
+        return Err("delete key mismatch");
+      }
+    }
+    _ => {
+      return Err("delete roundtrip failed");
+    }
+  }
+
+  return Ok(Ack.Done);
+}
+
+fn test_response_roundtrip() -> Result<Ack, String>
+  intent "Test encoding and decoding of all Response variants."
+  requires none
+  ensures none
+  effects none
+{
+  // 1. Success
+  let res_succ = Response.Success;
+  let enc_succ = encode_response(&res_succ);
+  let payload_succ = enc_succ.slice(4, enc_succ.byte_len())?;
+  match parse_response(&payload_succ) {
+    Ok(Response.Success) => {}
+    _ => {
+      return Err("success roundtrip failed");
+    }
+  }
+
+  // 2. Value
+  let val = "return_value".as_bytes();
+  let res_val = Response.Value(val.clone());
+  let enc_val = encode_response(&res_val);
+  let payload_val = enc_val.slice(4, enc_val.byte_len())?;
+  match parse_response(&payload_val) {
+    Ok(Response.Value(v)) => {
+      if !bytes_eq(&v, &val) {
+        return Err("value content mismatch");
+      }
+    }
+    _ => {
+      return Err("value roundtrip failed");
+    }
+  }
+
+  // 3. NotFound
+  let res_nf = Response.NotFound;
+  let enc_nf = encode_response(&res_nf);
+  let payload_nf = enc_nf.slice(4, enc_nf.byte_len())?;
+  match parse_response(&payload_nf) {
+    Ok(Response.NotFound) => {}
+    _ => {
+      return Err("not_found roundtrip failed");
+    }
+  }
+
+  // 4. Error
+  let msg = "bad key".as_bytes();
+  let res_err = Response.Error(3, msg.clone());
+  let enc_err = encode_response(&res_err);
+  let payload_err = enc_err.slice(4, enc_err.byte_len())?;
+  match parse_response(&payload_err) {
+    Ok(Response.Error(c, m)) => {
+      if c != 3 || !bytes_eq(&m, &msg) {
+        return Err("error content mismatch");
+      }
+    }
+    _ => {
+      return Err("error roundtrip failed");
+    }
+  }
+
+  return Ok(Ack.Done);
+}
+
+fn test_invalid_parsing() -> Result<Ack, String>
+  intent "Test error handling on malformed or invalid request payloads."
+  requires none
+  ensures none
+  effects none
+{
+  // Payload too short (< 2 bytes)
+  let mut too_short = Bytes.new();
+  too_short.push(1);
+  match parse_request(&too_short) {
+    Err(ProtoError.InvalidLength) => {}
+    _ => {
+      return Err("expected InvalidLength for payload < 2 bytes");
+    }
+  }
+
+  // Unsupported version (Version 2)
+  let mut bad_ver = Bytes.new();
+  bad_ver.push(2);
+  bad_ver.push(1);
+  match parse_request(&bad_ver) {
+    Err(ProtoError.UnsupportedVersion) => {}
+    _ => {
+      return Err("expected UnsupportedVersion for version != 1");
+    }
+  }
+
+  // Unknown Op (Op 99)
+  let mut unknown_op = Bytes.new();
+  unknown_op.push(1);
+  unknown_op.push(99);
+  match parse_request(&unknown_op) {
+    Err(ProtoError.UnknownOp) => {}
+    _ => {
+      return Err("expected UnknownOp for op == 99");
+    }
+  }
+
+  // Malformed GET (truncated key_len)
+  let mut bad_get = Bytes.new();
+  bad_get.push(1);
+  bad_get.push(2);
+  bad_get.push(0);
+  bad_get.push(10);
+  bad_get.push(65);  // only 1 byte instead of 10
+  match parse_request(&bad_get) {
+    Err(ProtoError.InvalidPayload) => {}
+    _ => {
+      return Err("expected InvalidPayload for truncated get");
+    }
+  }
+
+  // Malformed PUT (invalid ttl_tag 99)
+  let mut bad_put = Bytes.new();
+  bad_put.push(1);
+  bad_put.push(3);
+  bad_put.push_u16_be(1);
+  bad_put.push(65);
+  bad_put.push_u16_be(1);
+  bad_put.push(66);
+  bad_put.push(99);  // bad ttl tag
+  match parse_request(&bad_put) {
+    Err(ProtoError.InvalidPayload) => {}
+    _ => {
+      return Err("expected InvalidPayload for invalid ttl_tag");
+    }
+  }
+
+  return Ok(Ack.Done);
+}
+
+fn test_read_i64() -> Result<Ack, String>
+  intent "Verify read_i64 correctly decodes signed 64-bit integers including boundary values."
+  requires none
+  ensures none
+  effects none
+{
+  // 0
+  let mut b0 = Bytes.new();
+  let mut i = 0;
+  while i < 8 {
+    b0.push(0);
+    i = i + 1;
+  }
+  if read_i64(&b0, 0) != 0 {
+    return Err("read_i64 0 failed");
+  }
+
+  // -1 (0xFFFFFFFFFFFFFFFF)
+  let mut b_neg1 = Bytes.new();
+  i = 0;
+  while i < 8 {
+    b_neg1.push(255);
+    i = i + 1;
+  }
+  if read_i64(&b_neg1, 0) != -1 {
+    return Err("read_i64 -1 failed");
+  }
+
+  // i64::MAX = 9223372036854775807 (0x7FFFFFFFFFFFFFFF)
+  let mut b_max = Bytes.new();
+  b_max.push(127);
+  i = 0;
+  while i < 7 {
+    b_max.push(255);
+    i = i + 1;
+  }
+  if read_i64(&b_max, 0) != 9223372036854775807 {
+    return Err("read_i64 i64::MAX failed");
+  }
+
+  // i64::MIN = -9223372036854775808 (0x8000000000000000)
+  let mut b_min = Bytes.new();
+  b_min.push(128);
+  i = 0;
+  while i < 7 {
+    b_min.push(0);
+    i = i + 1;
+  }
+  let min_val = -9223372036854775807 - 1;
+  if read_i64(&b_min, 0) != min_val {
+    return Err("read_i64 i64::MIN failed");
+  }
+
+  return Ok(Ack.Done);
+}
+
+fn test_error_code_mapping() -> Result<Ack, String>
+  intent "Verify round-trip of KvError to protocol code and back."
+  requires none
+  ensures none
+  effects none
+{
+  if kv_error_code(KvError.KeyLength) != 3 {
+    return Err("KeyLength code != 3");
+  }
+  if kv_error_code(KvError.ValueLength) != 4 {
+    return Err("ValueLength code != 4");
+  }
+  if kv_error_code(KvError.InvalidCapacity) != 15 {
+    return Err("InvalidCapacity code != 15");
+  }
+  if kv_error_code(KvError.Capacity) != 7 {
+    return Err("Capacity code != 7");
+  }
+  if kv_error_code(KvError.TtlRequired) != 8 {
+    return Err("TtlRequired code != 8");
+  }
+  if kv_error_code(KvError.InvalidTtl) != 9 {
+    return Err("InvalidTtl code != 9");
+  }
+
+  match code_to_kv_error(15) {
+    Some(KvError.InvalidCapacity) => {}
+    _ => {
+      return Err("code 15 did not map to InvalidCapacity");
+    }
+  }
+  match code_to_kv_error(3) {
+    Some(KvError.KeyLength) => {}
+    _ => {
+      return Err("code 3 did not map to KeyLength");
+    }
+  }
+  match code_to_kv_error(7) {
+    Some(KvError.Capacity) => {}
+    _ => {
+      return Err("code 7 did not map to Capacity");
+    }
+  }
+  match code_to_kv_error(999) {
+    None => {}
+    _ => {
+      return Err("code 999 mapped to something");
+    }
+  }
+
+  return Ok(Ack.Done);
+}
+
+pub fn main() -> Int
+  intent "Run protocol unit tests. Return 0 on success, non-zero on failure."
+  requires none
+  ensures none
+  effects none
+{
+  match test_request_roundtrip() {
+    Ok(_) => {}
+    Err(_) => {
+      return 1;
+    }
+  }
+  match test_response_roundtrip() {
+    Ok(_) => {}
+    Err(_) => {
+      return 2;
+    }
+  }
+  match test_invalid_parsing() {
+    Ok(_) => {}
+    Err(_) => {
+      return 3;
+    }
+  }
+  match test_error_code_mapping() {
+    Ok(_) => {}
+    Err(_) => {
+      return 4;
+    }
+  }
+  match test_read_i64() {
+    Ok(_) => {}
+    Err(_) => {
+      return 5;
+    }
+  }
+  return 0;
+}

@@ -24,6 +24,15 @@ Sigil の ADR 参照版 `0c1c441e60933fadbe05e1c5c63b11bcf4ad4409` と ADR マ�
 - 段 1 の公開型 `Ttl`、`Ack`、`KvError` を再利用し、段 1 の `stash.memory` は変更しない。キー・行の上限検査は段 1 と同じ式を `stash.persistent` に持つ。
 - 試験の追加: `tests/persistent_contract.sigil`（段 1 と同じ操作契約）と `tests/persistent_recovery.sigil`（再起動後の成功済み更新と削除、期限を作り直さないこと、期限切れ後の再起動、排他ロック、`CommitUnknown` での停止と復旧、4 件の更新の全 I/O 関門を `EIO`・直前の死亡・torn write で中断して再起動後の値と期限の組を全有／全無で確認）。故障注入は核が公開している I/O 関門（`db.iohook`）だけを使う。
 
+## TCP と Sigil クライアント（段 3）
+
+[ADR 0059 決定 2・3](https://github.com/goodnasubi/sigil/blob/947815bfa367354dec99bd6308b8931949dec49c/docs/decisions/0059-kv-store.md) の版付き最小バイナリ TCP プロトコルと、Sigil 向けの型付きクライアント・サーバーを提供する。
+
+- **プロトコル (`stash.protocol`)**: 各フレームは 32 bit 符号なしビッグエンディアン長、1 byte の版（初版は 1）、1 byte の操作または結果種別、本文で構成。フレーム長は版から末尾までのバイト数（2〜4096 byte）。可変長フィールドは長さ（u16 BE）とバイト列、TTL は秒の整数（i64 BE）。詳細は [docs/spec/protocol.md](docs/spec/protocol.md) の仕様表と `tests/fixtures/` の正例・負例 fixture を参照。
+- **サーバー (`stash.server`)**: 既定でループバック（`127.0.0.1`）で待ち受け。接続ごとに 1 要求を直列に処理し、要求と応答は 1 対 1。応答は成功（`Success`）、値（`Value`）、キーなし（`NotFound`）、型付きエラー（`Error`）を区別する。未知の操作や引数誤りはエラー応答を返し、未対応版や 2〜4096 byte 範囲外の不正長、切断、タイムアウト（5000 ms）は接続を切断する。同時接続上限は 64。キー・値・セッション ID をログに出さない。
+- **クライアント (`stash.client`)**: Sigil 製の型付きクライアント。公開操作は `connect`、`ping`、`get`、`put`、`delete`。
+- **試験 (`tests/tcp.rs`)**: ループバック統合試験で正常系、分割読み取り、不正長、未対応版、キー・値の上限、同時接続、タイムアウト、切断を検証し、決定論的乱数によるパーサーのファジングを実施・記録する。
+
 ## 固定版
 
 永続アダプターのビルドと試験は `deps/pins.env` の 2 つの完全なコミット SHA だけを使う。浮動する `main` は取得しない。
@@ -44,7 +53,7 @@ scripts/fetch-deps.sh                      # .deps/ に固定コミットを取�
 cargo build --release --locked --manifest-path .deps/sigil-compiler/Cargo.toml
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-SIGIL="$PWD/.deps/sigil-compiler/target/release/sigil" cargo test --locked
+SIGIL="$PWD/.deps/sigil-compiler/target/release/sigil" SIGIL_DB_CORE="$PWD/.deps/sigil-db-core" cargo test --locked
 ```
 
-`cargo test` は Sigil の整形・型検査を行い、段 1 は固定時刻を用いる契約試験を、段 2 は上の契約試験と中断・復旧試験を、評価器とネイティブ実行の両方で検証する。
+`cargo test` は Sigil の整形・型検査を行い、段 1 は固定時刻を用いる契約試験を、段 2 は上の契約試験と中断・復旧試験を、段 3 は TCP ループバック統合試験とパーサーファジングを、評価器とネイティブ実行の両方で検証する。

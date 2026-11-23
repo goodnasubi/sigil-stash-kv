@@ -11,3 +11,7 @@ path = "tests/contract.rs"
 [[test]]
 name = "persistent"
 path = "tests/persistent.rs"
+
+[[test]]
+name = "tcp"
+path = "tests/tcp.rs"

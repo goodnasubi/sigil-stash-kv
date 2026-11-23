@@ -1,0 +1,46 @@
+module tests.tcp_server_main
+  targets server
+  trust none
+
+use stash.memory.new_memory;
+use stash.server.serve;
+
+fn run_server() -> Result<Unit, NetError>
+  intent "Bind, report port and run server."
+  requires none
+  ensures none
+  effects clock, console, net.server, task
+{
+  let listener = net.listen(&"127.0.0.1", 0, 128)?;
+  let port = listener.local_port();
+  console.log(&port);
+  match new_memory(100, false) {
+    Ok(mem) => {
+      let store = SyncShared.new(Lock.new(mem));
+      serve(&listener, 64, store)?;
+      return Ok(unit());
+    }
+    Err(_) => {
+      return Err(NetError.Other);
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "Start a loopback stash-kv TCP server and output its assigned port."
+  requires none
+  ensures none
+  effects clock, console, net.server, task
+{
+  return match run_server() {
+    Ok(_) => 0,
+    Err(_) => 1,
+  };
+}
+
+fn unit()
+  intent "Return unit."
+  requires none
+  ensures none
+  effects none
+{}
