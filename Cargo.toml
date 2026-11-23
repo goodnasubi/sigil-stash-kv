@@ -1,0 +1,9 @@
+[package]
+name = "sigil-stash-kv"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
