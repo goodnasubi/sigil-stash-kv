@@ -1,0 +1,257 @@
+module tests.contract
+  targets server
+  trust none
+
+use stash.memory.KvError;
+use stash.memory.Ttl;
+use stash.memory.delete;
+use stash.memory.get;
+use stash.memory.new_memory;
+use stash.memory.ping;
+use stash.memory.put;
+
+fn bytes(size: Int, byte: Int) -> Bytes
+  intent "Build a binary fixture."
+  requires none
+  ensures none
+  effects none
+{
+  let mut fixture = Bytes.new();
+  let mut i = 0;
+  while i < size {
+    fixture.push(byte);
+    i = i + 1;
+  }
+  return fixture;
+}
+
+fn start() -> Option<Int>
+  intent "Return the fixed time at which the first write occurs."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1);
+}
+
+fn before_deadline() -> Option<Int>
+  intent "Return one nanosecond before the first deadline."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1000000000);
+}
+
+fn at_deadline() -> Option<Int>
+  intent "Return the exact first deadline."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(1000000001);
+}
+
+fn renewed_deadline() -> Option<Int>
+  intent "Return the exact deadline established by renewal."
+  requires none
+  ensures none
+  effects none
+{
+  return Some(2000000001);
+}
+
+fn unavailable() -> Option<Int>
+  intent "Simulate a failing clock."
+  requires none
+  ensures none
+  effects none
+{
+  return None;
+}
+
+fn expiry_orders() -> Result<Int, KvError>
+  intent "Check expiry, both serialized orders of a read and replacement, and removal of a former deadline."
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_memory(1, false)?;
+  let key = bytes(1, 255);
+  let previous = bytes(1, 0);
+  let fresh = bytes(1, 128);
+  put(&mut store, &key, &previous, Ttl.Seconds(1), start)?;
+  if get(&mut store, &key, before_deadline)?.unwrap_or(Bytes.new()).get(0).unwrap_or(-1) != 0 {
+    return Ok(11);
+  }
+  // GET before PUT: the expired slot must be reusable at capacity.
+  if get(&mut store, &key, at_deadline)?.is_some() {
+    return Ok(12);
+  }
+  let other = bytes(1, 254);
+  put(&mut store, &other, &previous, Ttl.NoExpiry, unavailable)?;
+  delete(&mut store, &other)?;
+  put(&mut store, &key, &fresh, Ttl.Seconds(1), at_deadline)?;
+  if get(&mut store, &key, at_deadline)?.unwrap_or(Bytes.new()).get(0).unwrap_or(-1) != 128 {
+    return Ok(13);
+  }
+
+  // PUT before GET: the previous timeout cannot delete the new value.
+  let mut reverse = new_memory(1, false)?;
+  put(&mut reverse, &key, &previous, Ttl.Seconds(1), start)?;
+  put(&mut reverse, &key, &fresh, Ttl.Seconds(1), at_deadline)?;
+  if get(&mut reverse, &key, at_deadline)?.unwrap_or(Bytes.new()).get(0).unwrap_or(-1) != 128 {
+    return Ok(16);
+  }
+  if get(&mut reverse, &key, renewed_deadline)?.is_some() {
+    return Ok(17);
+  }
+
+  let mut without_expiry = new_memory(1, false)?;
+  put(&mut without_expiry, &key, &previous, Ttl.Seconds(1), start)?;
+  put(&mut without_expiry, &key, &fresh, Ttl.NoExpiry, unavailable)?;
+  if get(&mut without_expiry, &key, at_deadline)?.unwrap_or(Bytes.new()).get(0).unwrap_or(-1) != 128 {
+    return Ok(14);
+  }
+  delete(&mut without_expiry, &key)?;
+  delete(&mut without_expiry, &key)?;
+  if get(&mut without_expiry, &key, unavailable)?.is_some() {
+    return Ok(15);
+  }
+  ping()?;
+  return Ok(0);
+}
+
+fn rejected_replacements() -> Result<Int, KvError>
+  intent "Check that rejected TTL and clock operations preserve both the current value and its deadline."
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_memory(1, true)?;
+  let key = bytes(1, 0);
+  let previous = bytes(1, 42);
+  let fresh = bytes(1, 99);
+  put(&mut store, &key, &previous, Ttl.Seconds(1), start)?;
+  match put(&mut store, &key, &fresh, Ttl.NoExpiry, unavailable) {
+    Err(KvError.TtlRequired) => {}
+    _ => {
+      return Ok(21);
+    }
+  }
+  match put(&mut store, &key, &fresh, Ttl.Seconds(0), unavailable) {
+    Err(KvError.InvalidTtl) => {}
+    _ => {
+      return Ok(22);
+    }
+  }
+  match put(&mut store, &key, &fresh, Ttl.Seconds(9223372036854775807), start) {
+    Err(KvError.DeadlineOverflow) => {}
+    _ => {
+      return Ok(23);
+    }
+  }
+  match put(&mut store, &key, &fresh, Ttl.Seconds(1), unavailable) {
+    Err(KvError.ClockUnavailable) => {}
+    _ => {
+      return Ok(24);
+    }
+  }
+  match get(&mut store, &key, unavailable) {
+    Err(KvError.ClockUnavailable) => {}
+    _ => {
+      return Ok(25);
+    }
+  }
+  if get(&mut store, &key, before_deadline)?.unwrap_or(Bytes.new()).get(0).unwrap_or(-1) != 42 {
+    return Ok(26);
+  }
+  match get(&mut store, &key, start) {
+    Err(KvError.ClockRegressed) => {}
+    _ => {
+      return Ok(27);
+    }
+  }
+  match put(&mut store, &key, &fresh, Ttl.Seconds(1), start) {
+    Err(KvError.ClockRegressed) => {}
+    _ => {
+      return Ok(28);
+    }
+  }
+  if get(&mut store, &key, at_deadline)?.is_some() {
+    return Ok(29);
+  }
+  return Ok(0);
+}
+
+fn limits() -> Result<Int, KvError>
+  intent "Check public byte boundaries, empty values, and finite capacity without live eviction."
+  requires none
+  ensures none
+  effects none
+{
+  let mut store = new_memory(1, false)?;
+  let key = bytes(512, 0);
+  let value = bytes(3072, 255);
+  let empty = Bytes.new();
+  put(&mut store, &key, &value, Ttl.Seconds(1), start)?;
+  if get(&mut store, &key, start)?.unwrap_or(Bytes.new()).byte_len() != 3072 {
+    return Ok(31);
+  }
+  match put(&mut store, &key, &bytes(3073, 255), Ttl.NoExpiry, unavailable) {
+    Err(KvError.ValueLength) => {}
+    _ => {
+      return Ok(32);
+    }
+  }
+  match get(&mut store, &empty, unavailable) {
+    Err(KvError.KeyLength) => {}
+    _ => {
+      return Ok(33);
+    }
+  }
+  match delete(&mut store, &bytes(513, 0)) {
+    Err(KvError.KeyLength) => {}
+    _ => {
+      return Ok(34);
+    }
+  }
+  match put(&mut store, &bytes(512, 1), &empty, Ttl.NoExpiry, unavailable) {
+    Err(KvError.Capacity) => {}
+    _ => {
+      return Ok(35);
+    }
+  }
+  if get(&mut store, &key, start)?.unwrap_or(Bytes.new()).byte_len() != 3072 {
+    return Ok(36);
+  }
+  put(&mut store, &key, &empty, Ttl.NoExpiry, unavailable)?;
+  match get(&mut store, &key, unavailable)? {
+    Some(v) => {
+      if v.byte_len() != 0 {
+        return Ok(37);
+      }
+    }
+    None => {
+      return Ok(38);
+    }
+  }
+  return Ok(0);
+}
+
+pub fn main() -> Int
+  intent "Return zero on success or identify the failing contract check."
+  requires none
+  ensures none
+  effects none
+{
+  let expiry = expiry_orders().unwrap_or(10);
+  if expiry != 0 {
+    return expiry;
+  }
+  let rejected = rejected_replacements().unwrap_or(20);
+  if rejected != 0 {
+    return rejected;
+  }
+  return limits().unwrap_or(30);
+}

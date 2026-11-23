@@ -1,0 +1,272 @@
+module stash.memory
+  targets server
+  trust none
+
+pub enum Ttl {
+  NoExpiry,
+  Seconds(Int),
+}
+
+pub enum Ack {
+  Done,
+}
+
+pub enum KvError {
+  KeyLength,
+  ValueLength,
+  EncodedKeyLength,
+  EncodedRowLength,
+  InvalidCapacity,
+  Capacity,
+  TtlRequired,
+  InvalidTtl,
+  DeadlineOverflow,
+  ClockUnavailable,
+  ClockRegressed,
+}
+
+pub struct Entry {
+  key: Bytes,
+  value: Bytes,
+  deadline: Option<Int>,
+}
+
+pub struct Slot {
+  entry: Option<Entry>,
+}
+
+pub struct MemoryStore {
+  slots: List<Slot>,
+  capacity: Int,
+  require_ttl: Bool,
+  last_now: Int,
+}
+
+pub fn new_memory(capacity: Int, require_ttl: Bool) -> Result<MemoryStore, KvError>
+  intent "Create a bounded in-memory store. Cache and session callers must require a TTL."
+  requires none
+  ensures none
+  effects none
+{
+  if capacity <= 0 {
+    return Err(KvError.InvalidCapacity);
+  }
+  return Ok(MemoryStore { slots: List.new(), capacity: capacity, require_ttl: require_ttl, last_now: 0 });
+}
+
+fn validate_key(key: &Bytes) -> Result<Ack, KvError>
+  intent "Apply the public key limit and the encoded sigil-db key limit."
+  requires none
+  ensures none
+  effects none
+{
+  let size = key.byte_len();
+  if size < 1 || size > 512 {
+    return Err(KvError.KeyLength);
+  }
+  // Bytes column: one type tag, a four-byte length and the payload.
+  if 5 + size > 1024 {
+    return Err(KvError.EncodedKeyLength);
+  }
+  return Ok(Ack.Done);
+}
+
+fn validate_row(key: &Bytes, value: &Bytes) -> Result<Ack, KvError>
+  intent "Apply the public value limit and the encoded sigil-db row limit."
+  requires none
+  ensures none
+  effects none
+{
+  if value.byte_len() > 3072 {
+    return Err(KvError.ValueLength);
+  }
+  // Two-byte column count, two Bytes columns and one tagged Int deadline.
+  if 2 + (5 + key.byte_len()) + (5 + value.byte_len()) + 9 > 4096 {
+    return Err(KvError.EncodedRowLength);
+  }
+  return Ok(Ack.Done);
+}
+
+fn keys_equal(a: &Bytes, b: &Bytes) -> Bool
+  intent "Compare binary keys by their contents."
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn find(store: &MemoryStore, key: &Bytes) -> Int
+  intent "Find the slot for a key, or return -1 for an absent key."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < store.slots.len() {
+    match store.slots.get(i) {
+      Some(slot) => {
+        match slot.entry {
+          Some(entry) => {
+            if keys_equal(&entry.key, &key) {
+              return i;
+            }
+          }
+          None => {}
+        }
+      }
+      _ => {}
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn read_now(store: &mut MemoryStore, sample_time: fn() -> Option<Int>) -> Result<Int, KvError>
+  intent "Sample nonnegative monotonic nanoseconds in the same mutable borrow as the operation."
+  requires none
+  ensures none
+  effects of(sample_time)
+{
+  let now = sample_time().unwrap_or(-1);
+  if now < 0 {
+    return Err(KvError.ClockUnavailable);
+  }
+  if now < store.last_now {
+    return Err(KvError.ClockRegressed);
+  }
+  store.last_now = now;
+  return Ok(now);
+}
+
+pub fn get(store: &mut MemoryStore, key: &Bytes, sample_time: fn() -> Option<Int>) -> Result<Option<Bytes>, KvError>
+  intent "Read a live value, removing a matching expired entry within the same operation."
+  requires none
+  ensures none
+  effects of(sample_time)
+{
+  validate_key(&key)?;
+  let index = find(&store, &key);
+  let deadline = match store.slots.get(index) {
+    Some(slot) => match slot.entry {
+      Some(entry) => entry.deadline.clone(),
+      None => None,
+    },
+    _ => None,
+  };
+  match deadline {
+    Some(end) => {
+      let now = read_now(&mut store, sample_time)?;
+      if now >= end {
+        match store.slots.get_mut(index) {
+          Some(slot) => {
+            let _ = slot.entry.take();
+          }
+          None => {}
+        }
+        return Ok(None);
+      }
+    }
+    None => {}
+  }
+  return match store.slots.get(index) {
+    Some(slot) => match slot.entry {
+      Some(entry) => Ok(Some(entry.value.clone())),
+      None => Ok(None),
+    },
+    _ => Ok(None),
+  };
+}
+
+pub fn put(store: &mut MemoryStore, key: &Bytes, value: &Bytes, ttl: Ttl, sample_time: fn() -> Option<Int>) -> Result<Ack, KvError>
+  intent "Create or replace a value and its deadline together."
+  requires none
+  ensures none
+  effects of(sample_time)
+{
+  validate_key(&key)?;
+  validate_row(&key, &value)?;
+  let mut deadline = None;
+  match ttl {
+    Ttl.NoExpiry => {
+      if store.require_ttl {
+        return Err(KvError.TtlRequired);
+      }
+    }
+    Ttl.Seconds(seconds) => {
+      if seconds <= 0 {
+        return Err(KvError.InvalidTtl);
+      }
+      let now = read_now(&mut store, sample_time)?;
+      if seconds > (9223372036854775807 - now) / 1000000000 {
+        return Err(KvError.DeadlineOverflow);
+      }
+      deadline = Some(now + seconds * 1000000000);
+    }
+  }
+
+  let existing = find(&store, &key);
+  if existing >= 0 {
+    match store.slots.get_mut(existing) {
+      Some(slot) => {
+        slot.entry = Some(Entry { key: key.clone(), value: value.clone(), deadline: deadline });
+        return Ok(Ack.Done);
+      }
+      None => {}
+    }
+  }
+  let mut i = 0;
+  while i < store.slots.len() {
+    match store.slots.get_mut(i) {
+      Some(slot) => {
+        if slot.entry.is_none() {
+          slot.entry = Some(Entry { key: key.clone(), value: value.clone(), deadline: deadline });
+          return Ok(Ack.Done);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if store.slots.len() >= store.capacity {
+    return Err(KvError.Capacity);
+  }
+  store.slots.push(Slot { entry: Some(Entry { key: key.clone(), value: value.clone(), deadline: deadline }) });
+  return Ok(Ack.Done);
+}
+
+pub fn delete(store: &mut MemoryStore, key: &Bytes) -> Result<Ack, KvError>
+  intent "Remove a key if present and succeed for an absent key."
+  requires none
+  ensures none
+  effects none
+{
+  validate_key(&key)?;
+  let index = find(&store, &key);
+  match store.slots.get_mut(index) {
+    Some(slot) => {
+      let _ = slot.entry.take();
+    }
+    None => {}
+  }
+  return Ok(Ack.Done);
+}
+
+pub fn ping() -> Result<Ack, KvError>
+  intent "Respond successfully without accessing store data."
+  requires none
+  ensures none
+  effects none
+{
+  return Ok(Ack.Done);
+}
