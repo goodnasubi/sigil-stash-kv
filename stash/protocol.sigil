@@ -1,0 +1,437 @@
+module stash.protocol
+  targets server
+  trust none
+
+use stash.memory.KvError;
+use stash.memory.Ttl;
+
+pub enum Request {
+  Ping,
+  Get(Bytes),
+  Put(Bytes, Bytes, Ttl),
+  Delete(Bytes),
+}
+
+pub enum Response {
+  Success,
+  Value(Bytes),
+  NotFound,
+  Error(Int, Bytes),
+}
+
+pub enum ProtoError {
+  Closed,
+  InvalidLength,
+  UnsupportedVersion,
+  UnknownOp,
+  InvalidPayload,
+  Other,
+}
+
+pub fn kv_error_code(e: KvError) -> Int
+  intent "Map a KvError to its protocol error code."
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    KvError.KeyLength => 3,
+    KvError.ValueLength => 4,
+    KvError.EncodedKeyLength => 5,
+    KvError.EncodedRowLength => 6,
+    KvError.InvalidCapacity => 2,
+    KvError.Capacity => 7,
+    KvError.TtlRequired => 8,
+    KvError.InvalidTtl => 9,
+    KvError.DeadlineOverflow => 10,
+    KvError.ClockUnavailable => 11,
+    KvError.ClockRegressed => 12,
+  };
+}
+
+pub fn code_to_kv_error(code: Int) -> Option<KvError>
+  intent "Map a protocol error code back to KvError if applicable."
+  requires none
+  ensures none
+  effects none
+{
+  if code == 3 {
+    return Some(KvError.KeyLength);
+  }
+  if code == 4 {
+    return Some(KvError.ValueLength);
+  }
+  if code == 5 {
+    return Some(KvError.EncodedKeyLength);
+  }
+  if code == 6 {
+    return Some(KvError.EncodedRowLength);
+  }
+  if code == 7 {
+    return Some(KvError.Capacity);
+  }
+  if code == 8 {
+    return Some(KvError.TtlRequired);
+  }
+  if code == 9 {
+    return Some(KvError.InvalidTtl);
+  }
+  if code == 10 {
+    return Some(KvError.DeadlineOverflow);
+  }
+  if code == 11 {
+    return Some(KvError.ClockUnavailable);
+  }
+  if code == 12 {
+    return Some(KvError.ClockRegressed);
+  }
+  return None;
+}
+
+pub fn read_u16(data: &Bytes, offset: Int) -> Int
+  intent "Read a 16-bit big-endian unsigned integer from data."
+  requires none
+  ensures none
+  effects none
+{
+  let b0 = data.get(offset).unwrap_or(0);
+  let b1 = data.get(offset + 1).unwrap_or(0);
+  return b0 * 256 + b1;
+}
+
+pub fn read_u64(data: &Bytes, offset: Int) -> Int
+  intent "Read a 64-bit big-endian non-negative integer from data."
+  requires none
+  ensures none
+  effects none
+{
+  let hi = data.read_u32_be(offset).unwrap_or(0);
+  let lo = data.read_u32_be(offset + 4).unwrap_or(0);
+  return hi * 4294967296 + lo;
+}
+
+pub fn encode_request(req: &Request) -> Bytes
+  intent "Encode a Request into a framed binary message (length + version + op + body)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(1);  // Version: 1
+  match req {
+    Request.Ping => {
+      payload.push(1);  // Op: 1 (PING)
+    }
+    Request.Get(key) => {
+      payload.push(2);  // Op: 2 (GET)
+      payload.push_u16_be(key.byte_len());
+      payload.extend(&key);
+    }
+    Request.Put(key, value, ttl) => {
+      payload.push(3);  // Op: 3 (PUT)
+      payload.push_u16_be(key.byte_len());
+      payload.extend(&key);
+      payload.push_u16_be(value.byte_len());
+      payload.extend(&value);
+      match ttl {
+        Ttl.NoExpiry => {
+          payload.push(0);
+        }
+        Ttl.Seconds(sec) => {
+          payload.push(1);
+          payload.push_u64_be(sec);
+        }
+      }
+    }
+    Request.Delete(key) => {
+      payload.push(4);  // Op: 4 (DELETE)
+      payload.push_u16_be(key.byte_len());
+      payload.extend(&key);
+    }
+  }
+  let mut frame = Bytes.new();
+  frame.push_u32_be(payload.byte_len());
+  frame.extend(&payload);
+  return frame;
+}
+
+pub fn parse_request(payload: &Bytes) -> Result<Request, ProtoError>
+  intent "Parse request payload (version + op + body) after length validation."
+  requires none
+  ensures none
+  effects none
+{
+  let len = payload.byte_len();
+  if len < 2 {
+    return Err(ProtoError.InvalidLength);
+  }
+  let version = payload.get(0).unwrap_or(0);
+  if version != 1 {
+    return Err(ProtoError.UnsupportedVersion);
+  }
+  let op = payload.get(1).unwrap_or(0);
+  if op == 1 {
+    if len != 2 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    return Ok(Request.Ping);
+  }
+  if op == 2 {
+    if len < 4 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key_len = read_u16(&payload, 2);
+    if len != 4 + key_len {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key = payload.slice(4, 4 + key_len).unwrap_or(Bytes.new());
+    return Ok(Request.Get(key));
+  }
+  if op == 3 {
+    if len < 5 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key_len = read_u16(&payload, 2);
+    let pos1 = 4 + key_len;
+    if len < pos1 + 2 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let val_len = read_u16(&payload, pos1);
+    let pos2 = pos1 + 2 + val_len;
+    if len < pos2 + 1 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key = payload.slice(4, 4 + key_len).unwrap_or(Bytes.new());
+    let value = payload.slice(pos1 + 2, pos2).unwrap_or(Bytes.new());
+    let ttl_tag = payload.get(pos2).unwrap_or(0);
+    if ttl_tag == 0 {
+      if len != pos2 + 1 {
+        return Err(ProtoError.InvalidPayload);
+      }
+      return Ok(Request.Put(key, value, Ttl.NoExpiry));
+    }
+    if ttl_tag == 1 {
+      if len != pos2 + 1 + 8 {
+        return Err(ProtoError.InvalidPayload);
+      }
+      let sec = read_u64(&payload, pos2 + 1);
+      return Ok(Request.Put(key, value, Ttl.Seconds(sec)));
+    }
+    return Err(ProtoError.InvalidPayload);
+  }
+  if op == 4 {
+    if len < 4 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key_len = read_u16(&payload, 2);
+    if len != 4 + key_len {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let key = payload.slice(4, 4 + key_len).unwrap_or(Bytes.new());
+    return Ok(Request.Delete(key));
+  }
+  return Err(ProtoError.UnknownOp);
+}
+
+pub fn encode_response(res: &Response) -> Bytes
+  intent "Encode a Response into a framed binary message (length + version + result + body)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(1);  // Version: 1
+  match res {
+    Response.Success => {
+      payload.push(1);  // Result: 1 (SUCCESS)
+    }
+    Response.Value(val) => {
+      payload.push(2);  // Result: 2 (VALUE)
+      payload.push_u16_be(val.byte_len());
+      payload.extend(&val);
+    }
+    Response.NotFound => {
+      payload.push(3);  // Result: 3 (NOT_FOUND)
+    }
+    Response.Error(code, msg) => {
+      payload.push(4);  // Result: 4 (ERROR)
+      payload.push(code + 0);
+      payload.push_u16_be(msg.byte_len());
+      payload.extend(&msg);
+    }
+  }
+  let mut frame = Bytes.new();
+  frame.push_u32_be(payload.byte_len());
+  frame.extend(&payload);
+  return frame;
+}
+
+pub fn parse_response(payload: &Bytes) -> Result<Response, ProtoError>
+  intent "Parse response payload (version + result + body) after length validation."
+  requires none
+  ensures none
+  effects none
+{
+  let len = payload.byte_len();
+  if len < 2 {
+    return Err(ProtoError.InvalidLength);
+  }
+  let version = payload.get(0).unwrap_or(0);
+  if version != 1 {
+    return Err(ProtoError.UnsupportedVersion);
+  }
+  let res_type = payload.get(1).unwrap_or(0);
+  if res_type == 1 {
+    if len != 2 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    return Ok(Response.Success);
+  }
+  if res_type == 2 {
+    if len < 4 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let val_len = read_u16(&payload, 2);
+    if len != 4 + val_len {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let val = payload.slice(4, 4 + val_len).unwrap_or(Bytes.new());
+    return Ok(Response.Value(val));
+  }
+  if res_type == 3 {
+    if len != 2 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    return Ok(Response.NotFound);
+  }
+  if res_type == 4 {
+    if len < 5 {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let code = payload.get(2).unwrap_or(0);
+    let msg_len = read_u16(&payload, 3);
+    if len != 5 + msg_len {
+      return Err(ProtoError.InvalidPayload);
+    }
+    let msg = payload.slice(5, 5 + msg_len).unwrap_or(Bytes.new());
+    return Ok(Response.Error(code, msg));
+  }
+  return Err(ProtoError.InvalidPayload);
+}
+
+pub fn read_exact_stream(stream: &TcpStream, count: Int) -> Result<Bytes, ProtoError>
+  intent "Read exactly count bytes from a server-side TcpStream."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut data = Bytes.new();
+  while data.byte_len() < count {
+    let mut size = count - data.byte_len();
+    if size > 4096 {
+      size = 4096;
+    }
+    match stream.read(size) {
+      Err(_) => {
+        return Err(ProtoError.Closed);
+      }
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(ProtoError.Closed);
+        }
+        data.extend(&chunk);
+      }
+    }
+  }
+  return Ok(data);
+}
+
+pub fn read_request(stream: &TcpStream) -> Result<Request, ProtoError>
+  intent "Read a framed request from a server-side TcpStream, validating length and version."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let header = read_exact_stream(&stream, 4)?;
+  let len = header.read_u32_be(0).unwrap_or(0);
+  if len < 2 || len > 4096 {
+    return Err(ProtoError.InvalidLength);
+  }
+  let payload = read_exact_stream(&stream, len)?;
+  return parse_request(&payload);
+}
+
+pub fn write_response(stream: &TcpStream, res: &Response) -> Result<Unit, ProtoError>
+  intent "Send a framed response to a server-side TcpStream."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let frame = encode_response(&res);
+  return match stream.write_all(&frame) {
+    Ok(_) => Ok(unit()),
+    Err(_) => Err(ProtoError.Other),
+  };
+}
+
+pub fn read_exact_client(client: &mut TcpClient, count: Int) -> Result<Bytes, ProtoError>
+  intent "Read exactly count bytes from a client-side TcpClient."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut data = Bytes.new();
+  while data.byte_len() < count {
+    let mut size = count - data.byte_len();
+    if size > 4096 {
+      size = 4096;
+    }
+    match client.read(size) {
+      Err(_) => {
+        return Err(ProtoError.Closed);
+      }
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(ProtoError.Closed);
+        }
+        data.extend(&chunk);
+      }
+    }
+  }
+  return Ok(data);
+}
+
+pub fn read_response(client: &mut TcpClient) -> Result<Response, ProtoError>
+  intent "Read a framed response from a client-side TcpClient."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let header = read_exact_client(&mut client, 4)?;
+  let len = header.read_u32_be(0).unwrap_or(0);
+  if len < 2 || len > 4096 {
+    return Err(ProtoError.InvalidLength);
+  }
+  let payload = read_exact_client(&mut client, len)?;
+  return parse_response(&payload);
+}
+
+pub fn write_request(client: &mut TcpClient, req: &Request) -> Result<Unit, ProtoError>
+  intent "Send a framed request from a client-side TcpClient."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let frame = encode_request(&req);
+  return match client.write_all(&frame) {
+    Ok(_) => Ok(unit()),
+    Err(_) => Err(ProtoError.Other),
+  };
+}
+
+fn unit()
+  intent "Create Unit."
+  requires none
+  ensures none
+  effects none
+{}

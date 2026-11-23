@@ -1,0 +1,162 @@
+module stash.client
+  targets server
+  trust none
+
+use stash.memory.Ack;
+use stash.memory.KvError;
+use stash.memory.Ttl;
+use stash.protocol.ProtoError;
+use stash.protocol.Request;
+use stash.protocol.Response;
+use stash.protocol.code_to_kv_error;
+use stash.protocol.read_response;
+use stash.protocol.write_request;
+
+pub enum ClientError {
+  Net(NetError),
+  Proto(ProtoError),
+  Kv(KvError),
+  Server(Int, Bytes),
+  UnexpectedResponse,
+}
+
+pub struct Client {
+  stream: TcpClient,
+}
+
+pub fn connect(host: &String, port: Int) -> Result<Client, ClientError>
+  intent "Connect to a stash-kv TCP server."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  return match net.connect(&host, port) {
+    Ok(s) => Ok(Client { stream: s }),
+    Err(e) => Err(ClientError.Net(e)),
+  };
+}
+
+pub fn ping(client: &mut Client) -> Result<Ack, ClientError>
+  intent "Send a PING request and wait for a SUCCESS response."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match write_request(&mut client.stream, &Request.Ping) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  let mut res = Response.NotFound;
+  match read_response(&mut client.stream) {
+    Ok(r) => {
+      res = r;
+    }
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  return match res {
+    Response.Success => Ok(Ack.Done),
+    Response.Error(code, msg) => match code_to_kv_error(code) {
+      Some(k) => Err(ClientError.Kv(k)),
+      None => Err(ClientError.Server(code, msg)),
+    },
+    _ => Err(ClientError.UnexpectedResponse),
+  };
+}
+
+pub fn get(client: &mut Client, key: &Bytes) -> Result<Option<Bytes>, ClientError>
+  intent "Send a GET request and return the value or None."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match write_request(&mut client.stream, &Request.Get(key.clone())) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  let mut res = Response.NotFound;
+  match read_response(&mut client.stream) {
+    Ok(r) => {
+      res = r;
+    }
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  return match res {
+    Response.Value(v) => Ok(Some(v)),
+    Response.NotFound => Ok(None),
+    Response.Error(code, msg) => match code_to_kv_error(code) {
+      Some(k) => Err(ClientError.Kv(k)),
+      None => Err(ClientError.Server(code, msg)),
+    },
+    _ => Err(ClientError.UnexpectedResponse),
+  };
+}
+
+pub fn put(client: &mut Client, key: &Bytes, value: &Bytes, ttl: Ttl) -> Result<Ack, ClientError>
+  intent "Send a PUT request and wait for a SUCCESS response."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match write_request(&mut client.stream, &Request.Put(key.clone(), value.clone(), ttl)) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  let mut res = Response.NotFound;
+  match read_response(&mut client.stream) {
+    Ok(r) => {
+      res = r;
+    }
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  return match res {
+    Response.Success => Ok(Ack.Done),
+    Response.Error(code, msg) => match code_to_kv_error(code) {
+      Some(k) => Err(ClientError.Kv(k)),
+      None => Err(ClientError.Server(code, msg)),
+    },
+    _ => Err(ClientError.UnexpectedResponse),
+  };
+}
+
+pub fn delete(client: &mut Client, key: &Bytes) -> Result<Ack, ClientError>
+  intent "Send a DELETE request and wait for a SUCCESS response."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match write_request(&mut client.stream, &Request.Delete(key.clone())) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  let mut res = Response.NotFound;
+  match read_response(&mut client.stream) {
+    Ok(r) => {
+      res = r;
+    }
+    Err(e) => {
+      return Err(ClientError.Proto(e));
+    }
+  }
+  return match res {
+    Response.Success => Ok(Ack.Done),
+    Response.Error(code, msg) => match code_to_kv_error(code) {
+      Some(k) => Err(ClientError.Kv(k)),
+      None => Err(ClientError.Server(code, msg)),
+    },
+    _ => Err(ClientError.UnexpectedResponse),
+  };
+}

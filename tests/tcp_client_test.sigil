@@ -1,0 +1,113 @@
+module tests.tcp_client_test
+  targets server
+  trust none
+
+use stash.client.Client;
+use stash.client.connect;
+use stash.client.delete;
+use stash.client.get;
+use stash.client.ping;
+use stash.client.put;
+use stash.memory.Ack;
+use stash.memory.Ttl;
+
+fn bytes_eq(a: &Bytes, b: &Bytes) -> Bool
+  intent "Check whether two Bytes instances have identical contents."
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn run_client_ops(client: &mut Client) -> Result<Unit, String>
+  intent "Run full cycle of client operations against a live server."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  // 1. PING
+  match ping(&mut client) {
+    Ok(Ack.Done) => {}
+    Err(_) => {
+      return Err("ping failed");
+    }
+  }
+
+  // 2. PUT
+  let key = "sigil_client_key".as_bytes();
+  let val = "sigil_client_val".as_bytes();
+  match put(&mut client, &key, &val, Ttl.NoExpiry) {
+    Ok(Ack.Done) => {}
+    Err(_) => {
+      return Err("put failed");
+    }
+  }
+
+  // 3. GET
+  match get(&mut client, &key) {
+    Ok(Some(v)) => {
+      if !bytes_eq(&v, &val) {
+        return Err("get returned incorrect value");
+      }
+    }
+    _ => {
+      return Err("get failed");
+    }
+  }
+
+  // 4. DELETE
+  match delete(&mut client, &key) {
+    Ok(Ack.Done) => {}
+    Err(_) => {
+      return Err("delete failed");
+    }
+  }
+
+  // 5. GET after DELETE (should be None)
+  match get(&mut client, &key) {
+    Ok(None) => {}
+    _ => {
+      return Err("get after delete should be None");
+    }
+  }
+
+  return Ok(unit());
+}
+
+pub fn main(port: Int) -> Int
+  intent "Run Sigil client integration test with server on specified port."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match connect(&"127.0.0.1", port) {
+    Ok(client) => {
+      let mut c = client;
+      return match run_client_ops(&mut c) {
+        Ok(_) => 0,
+        Err(_) => 1,
+      };
+    }
+    Err(_) => {
+      return 2;
+    }
+  }
+}
+
+fn unit()
+  intent "Return unit."
+  requires none
+  ensures none
+  effects none
+{}
