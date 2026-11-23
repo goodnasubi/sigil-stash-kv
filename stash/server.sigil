@@ -187,8 +187,8 @@ pub fn serve(listener: &TcpListener, capacity_limit: Int, store: SyncShared<Lock
           Err(NetError.Closed) => {
             return Ok(unit());
           }
-          Err(e) => {
-            return Err(e);
+          Err(_) => {
+            // Transient accept error (e.g. connection reset or file descriptor limit); continue accepting.
           }
         }
       }

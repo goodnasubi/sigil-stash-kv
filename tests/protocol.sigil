@@ -14,6 +14,7 @@ use stash.protocol.encode_response;
 use stash.protocol.kv_error_code;
 use stash.protocol.parse_request;
 use stash.protocol.parse_response;
+use stash.protocol.read_i64;
 
 fn bytes_eq(a: &Bytes, b: &Bytes) -> Bool
   intent "Check whether two Bytes instances have identical contents."
@@ -250,6 +251,62 @@ fn test_invalid_parsing() -> Result<Ack, String>
   return Ok(Ack.Done);
 }
 
+fn test_read_i64() -> Result<Ack, String>
+  intent "Verify read_i64 correctly decodes signed 64-bit integers including boundary values."
+  requires none
+  ensures none
+  effects none
+{
+  // 0
+  let mut b0 = Bytes.new();
+  let mut i = 0;
+  while i < 8 {
+    b0.push(0);
+    i = i + 1;
+  }
+  if read_i64(&b0, 0) != 0 {
+    return Err("read_i64 0 failed");
+  }
+
+  // -1 (0xFFFFFFFFFFFFFFFF)
+  let mut b_neg1 = Bytes.new();
+  i = 0;
+  while i < 8 {
+    b_neg1.push(255);
+    i = i + 1;
+  }
+  if read_i64(&b_neg1, 0) != -1 {
+    return Err("read_i64 -1 failed");
+  }
+
+  // i64::MAX = 9223372036854775807 (0x7FFFFFFFFFFFFFFF)
+  let mut b_max = Bytes.new();
+  b_max.push(127);
+  i = 0;
+  while i < 7 {
+    b_max.push(255);
+    i = i + 1;
+  }
+  if read_i64(&b_max, 0) != 9223372036854775807 {
+    return Err("read_i64 i64::MAX failed");
+  }
+
+  // i64::MIN = -9223372036854775808 (0x8000000000000000)
+  let mut b_min = Bytes.new();
+  b_min.push(128);
+  i = 0;
+  while i < 7 {
+    b_min.push(0);
+    i = i + 1;
+  }
+  let min_val = -9223372036854775807 - 1;
+  if read_i64(&b_min, 0) != min_val {
+    return Err("read_i64 i64::MIN failed");
+  }
+
+  return Ok(Ack.Done);
+}
+
 fn test_error_code_mapping() -> Result<Ack, String>
   intent "Verify round-trip of KvError to protocol code and back."
   requires none
@@ -262,6 +319,9 @@ fn test_error_code_mapping() -> Result<Ack, String>
   if kv_error_code(KvError.ValueLength) != 4 {
     return Err("ValueLength code != 4");
   }
+  if kv_error_code(KvError.InvalidCapacity) != 15 {
+    return Err("InvalidCapacity code != 15");
+  }
   if kv_error_code(KvError.Capacity) != 7 {
     return Err("Capacity code != 7");
   }
@@ -272,6 +332,12 @@ fn test_error_code_mapping() -> Result<Ack, String>
     return Err("InvalidTtl code != 9");
   }
 
+  match code_to_kv_error(15) {
+    Some(KvError.InvalidCapacity) => {}
+    _ => {
+      return Err("code 15 did not map to InvalidCapacity");
+    }
+  }
   match code_to_kv_error(3) {
     Some(KvError.KeyLength) => {}
     _ => {
@@ -322,6 +388,12 @@ pub fn main() -> Int
     Ok(_) => {}
     Err(_) => {
       return 4;
+    }
+  }
+  match test_read_i64() {
+    Ok(_) => {}
+    Err(_) => {
+      return 5;
     }
   }
   return 0;

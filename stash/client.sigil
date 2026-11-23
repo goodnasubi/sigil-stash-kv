@@ -20,6 +20,12 @@ pub enum ClientError {
   UnexpectedResponse,
 }
 
+// Note on frame limits:
+// The server enforces a maximum frame length of 4096 bytes. If a request's total
+// length exceeds 4096 bytes (even if key <= 512 and val <= 3072), the server closes
+// the connection immediately, resulting in ClientError.Proto(ProtoError.Closed)
+// rather than an application-level Kv(KvError) response.
+
 pub struct Client {
   stream: TcpClient,
 }

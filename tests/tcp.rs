@@ -4,8 +4,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,7 +49,8 @@ impl Drop for ServerProcess {
 fn start_server(root: &Path) -> ServerProcess {
     let out = root.join("target");
     fs::create_dir_all(&out).expect("create target dir");
-    let binary = out.join(format!("tcp-server-{}", std::process::id()));
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let binary = out.join(format!("tcp-server-{}-{id}", std::process::id()));
 
     sigil(
         root,
@@ -69,8 +74,27 @@ fn start_server(root: &Path) -> ServerProcess {
 
     let stdout = child.stdout.take().expect("capture server stdout");
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read server port");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let res = reader.read_line(&mut line).map(|_| line);
+        let _ = tx.send(res);
+    });
+
+    let line = match rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("failed to read server port from stdout: {e}");
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for server port on stdout");
+        }
+    };
+
     let port: u16 = line
         .trim()
         .parse()
@@ -122,6 +146,39 @@ fn read_response(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((res_type, body))
 }
 
+fn decode_response_bytes(data: &[u8]) -> std::io::Result<(u8, Vec<u8>)> {
+    if data.len() < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "too short for length header",
+        ));
+    }
+    let length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if !(2..=4096).contains(&length) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid length {length}"),
+        ));
+    }
+    if data.len() < 4 + length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "payload truncated",
+        ));
+    }
+    let payload = &data[4..4 + length];
+    let version = payload[0];
+    if version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported version {version}"),
+        ));
+    }
+    let res_type = payload[1];
+    let body = payload[2..].to_vec();
+    Ok((res_type, body))
+}
+
 #[test]
 fn test_protocol_sigil_checks() {
     let root = manifest_dir();
@@ -160,7 +217,8 @@ fn test_protocol_sigil_checks() {
 
     // Run tests/protocol.sigil in native
     let out_dir = root.join("target");
-    let proto_bin = out_dir.join(format!("test-proto-{}", std::process::id()));
+    let proto_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let proto_bin = out_dir.join(format!("test-proto-{}-{proto_id}", std::process::id()));
     sigil(
         &root,
         &[
@@ -445,39 +503,214 @@ fn test_loopback_integration() {
         );
     }
 
-    // 11. Fixtures verification
+    // 11. Fixtures verification (all 16 fixtures)
     {
         let fix_dir = root.join("tests/fixtures");
-        if fix_dir.exists() {
-            // Test valid ping fixture
-            let ping_data = fs::read(fix_dir.join("req_ping.bin")).expect("read req_ping.bin");
-            let mut stream = TcpStream::connect(&addr).expect("connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            stream.write_all(&ping_data).unwrap();
-            let (res_type, _) = read_response(&mut stream).unwrap();
-            assert_eq!(res_type, 1);
+        assert!(fix_dir.is_dir(), "tests/fixtures directory must exist");
 
-            // Test max frame boundary fixture (length 4096)
-            let max_data =
-                fs::read(fix_dir.join("req_max_frame.bin")).expect("read req_max_frame.bin");
+        // 11.1 Valid Request Fixtures
+        // req_ping.bin: PING -> SUCCESS (1)
+        {
+            let data = fs::read(fix_dir.join("req_ping.bin")).expect("read req_ping.bin");
             let mut stream = TcpStream::connect(&addr).expect("connect");
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            stream.write_all(&max_data).unwrap();
-            // Should get error (ValueLength > 3072) or success, but connection handled cleanly
+            stream.write_all(&data).unwrap();
+            let (res_type, body) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 1, "req_ping expected SUCCESS (1)");
+            assert!(body.is_empty());
+        }
+
+        // req_put_no_ttl.bin: PUT key="k", val="v1", no ttl -> SUCCESS (1)
+        {
+            let data =
+                fs::read(fix_dir.join("req_put_no_ttl.bin")).expect("read req_put_no_ttl.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, _) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 1, "req_put_no_ttl expected SUCCESS (1)");
+        }
+
+        // req_put_ttl.bin: PUT key="k", val="v1", ttl 60s -> SUCCESS (1)
+        {
+            let data = fs::read(fix_dir.join("req_put_ttl.bin")).expect("read req_put_ttl.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, _) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 1, "req_put_ttl expected SUCCESS (1)");
+        }
+
+        // req_get.bin: GET key="abc" -> NOT_FOUND (3)
+        {
+            let data = fs::read(fix_dir.join("req_get.bin")).expect("read req_get.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, _) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 3, "req_get for absent key expected NOT_FOUND (3)");
+        }
+
+        // req_delete.bin: DELETE key="abc" -> SUCCESS (1)
+        {
+            let data = fs::read(fix_dir.join("req_delete.bin")).expect("read req_delete.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, _) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 1, "req_delete expected SUCCESS (1)");
+        }
+
+        // req_max_frame.bin: length 4096, value 4088 bytes -> ERROR (4), code 4 (ValueLength)
+        {
+            let data = fs::read(fix_dir.join("req_max_frame.bin")).expect("read req_max_frame.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, body) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 4, "req_max_frame expected ERROR (4)");
+            assert_eq!(body[0], 4, "ValueLength error for 4088 byte value");
+        }
+
+        // 11.2 Invalid Request Fixtures (Error response or Disconnection)
+        // err_length_too_small.bin (len < 2) -> immediate disconnect
+        {
+            let data = fs::read(fix_dir.join("err_length_too_small.bin"))
+                .expect("read err_length_too_small.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let mut buf = [0u8; 1];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            assert_eq!(n, 0, "err_length_too_small must cause immediate disconnect");
+        }
+
+        // err_length_too_large.bin (len > 4096) -> immediate disconnect
+        {
+            let data = fs::read(fix_dir.join("err_length_too_large.bin"))
+                .expect("read err_length_too_large.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let mut buf = [0u8; 1];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            assert_eq!(n, 0, "err_length_too_large must cause immediate disconnect");
+        }
+
+        // err_unsupported_version.bin (ver != 1) -> immediate disconnect
+        {
+            let data = fs::read(fix_dir.join("err_unsupported_version.bin"))
+                .expect("read err_unsupported_version.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let mut buf = [0u8; 1];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            assert_eq!(
+                n, 0,
+                "err_unsupported_version must cause immediate disconnect"
+            );
+        }
+
+        // err_unknown_op.bin (op == 99) -> ERROR (4), code 1 (UnknownOp), connection alive
+        {
+            let data =
+                fs::read(fix_dir.join("err_unknown_op.bin")).expect("read err_unknown_op.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
             let (res_type, body) = read_response(&mut stream).unwrap();
             assert_eq!(res_type, 4);
-            assert_eq!(body[0], 4, "ValueLength error for 4088 byte value");
+            assert_eq!(body[0], 1, "expected UnknownOp error (code 1)");
+        }
+
+        // err_truncated_payload.bin -> client closes after truncated payload, server handles cleanly
+        {
+            let data = fs::read(fix_dir.join("err_truncated_payload.bin"))
+                .expect("read err_truncated_payload.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream.write_all(&data).unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+
+        // err_invalid_ttl_tag.bin (ttl_tag == 99) -> ERROR (4), code 2 (InvalidPayload)
+        {
+            let data = fs::read(fix_dir.join("err_invalid_ttl_tag.bin"))
+                .expect("read err_invalid_ttl_tag.bin");
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(&data).unwrap();
+            let (res_type, body) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 4);
+            assert_eq!(body[0], 2, "expected InvalidPayload error (code 2)");
+        }
+
+        // 11.3 Response Fixtures Decoding
+        // res_success.bin
+        {
+            let data = fs::read(fix_dir.join("res_success.bin")).expect("read res_success.bin");
+            let (res_type, body) = decode_response_bytes(&data).expect("decode res_success");
+            assert_eq!(res_type, 1, "res_success type == 1");
+            assert!(body.is_empty());
+        }
+
+        // res_value.bin
+        {
+            let data = fs::read(fix_dir.join("res_value.bin")).expect("read res_value.bin");
+            let (res_type, body) = decode_response_bytes(&data).expect("decode res_value");
+            assert_eq!(res_type, 2, "res_value type == 2");
+            let val_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+            assert_eq!(val_len, 5);
+            assert_eq!(&body[2..2 + val_len], b"world");
+        }
+
+        // res_not_found.bin
+        {
+            let data = fs::read(fix_dir.join("res_not_found.bin")).expect("read res_not_found.bin");
+            let (res_type, body) = decode_response_bytes(&data).expect("decode res_not_found");
+            assert_eq!(res_type, 3, "res_not_found type == 3");
+            assert!(body.is_empty());
+        }
+
+        // res_error.bin
+        {
+            let data = fs::read(fix_dir.join("res_error.bin")).expect("read res_error.bin");
+            let (res_type, body) = decode_response_bytes(&data).expect("decode res_error");
+            assert_eq!(res_type, 4, "res_error type == 4");
+            assert_eq!(body[0], 3, "error code == 3 (KeyLength)");
+            let msg_len = u16::from_be_bytes([body[1], body[2]]) as usize;
+            assert_eq!(msg_len, 3);
+            assert_eq!(&body[3..3 + msg_len], b"bad");
         }
     }
 
     // 12. Sigil client integration test (native)
     {
         let out_dir = root.join("target");
-        let client_bin = out_dir.join(format!("test-client-{}", std::process::id()));
+        let client_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let client_bin = out_dir.join(format!("test-client-{}-{client_id}", std::process::id()));
         sigil(
             &root,
             &[
@@ -531,6 +764,114 @@ fn test_loopback_integration() {
             }
         }
         assert_eq!(conns.len(), 16);
+    }
+
+    // 15. TTL boundaries: 0, -1, i64::MIN, i64::MAX
+    {
+        for (ttl_val, expected_code) in [
+            (0i64, 9u8),      // InvalidTtl
+            (-1i64, 9u8),     // InvalidTtl
+            (i64::MIN, 9u8),  // InvalidTtl
+            (i64::MAX, 10u8), // DeadlineOverflow
+        ] {
+            let mut stream = TcpStream::connect(&addr).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut put_body = Vec::new();
+            put_body.extend_from_slice(&1u16.to_be_bytes());
+            put_body.push(b'k');
+            put_body.extend_from_slice(&1u16.to_be_bytes());
+            put_body.push(b'v');
+            put_body.push(1); // ttl_tag = Seconds
+            put_body.extend_from_slice(&ttl_val.to_be_bytes());
+            let req = encode_req(3, &put_body);
+            stream.write_all(&req).unwrap();
+            let (res_type, body) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 4, "expected ERROR (4) for ttl {ttl_val}");
+            assert_eq!(
+                body[0], expected_code,
+                "expected error code {expected_code} for ttl {ttl_val}"
+            );
+
+            // Verify connection remains intact and server did not crash
+            stream.write_all(&encode_req(1, &[])).unwrap();
+            let (res_type, _) = read_response(&mut stream).unwrap();
+            assert_eq!(res_type, 1, "subsequent PING after ttl {ttl_val} succeeded");
+        }
+    }
+
+    // 16. Value length boundaries: 3072 bytes (success) and 3073 bytes (ValueLength error 4)
+    {
+        let mut stream = TcpStream::connect(&addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        // 3072 bytes value
+        let val_3072 = vec![b'x'; 3072];
+        let mut put_body = Vec::new();
+        put_body.extend_from_slice(&1u16.to_be_bytes());
+        put_body.push(b'k');
+        put_body.extend_from_slice(&(val_3072.len() as u16).to_be_bytes());
+        put_body.extend_from_slice(&val_3072);
+        put_body.push(0); // NoExpiry
+        let req = encode_req(3, &put_body);
+        stream.write_all(&req).unwrap();
+        let (res_type, _) = read_response(&mut stream).unwrap();
+        assert_eq!(res_type, 1, "PUT with 3072-byte value should succeed");
+
+        // 3073 bytes value (frame len = 2 + 3 + 2 + 3073 + 1 = 3081 <= 4096)
+        let val_3073 = vec![b'y'; 3073];
+        let mut put_body = Vec::new();
+        put_body.extend_from_slice(&1u16.to_be_bytes());
+        put_body.push(b'k');
+        put_body.extend_from_slice(&(val_3073.len() as u16).to_be_bytes());
+        put_body.extend_from_slice(&val_3073);
+        put_body.push(0); // NoExpiry
+        let req = encode_req(3, &put_body);
+        stream.write_all(&req).unwrap();
+        let (res_type, body) = read_response(&mut stream).unwrap();
+        assert_eq!(res_type, 4, "PUT with 3073-byte value should fail");
+        assert_eq!(body[0], 4, "expected ValueLength error (code 4)");
+    }
+
+    // 17. Capacity limit: max 64 connections, 65th connection is immediately dropped
+    {
+        let mut conns = Vec::new();
+        for _ in 0..64 {
+            let mut s = TcpStream::connect(&addr).expect("connect within capacity");
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            s.write_all(&encode_req(1, &[])).unwrap();
+            let (res_type, _) = read_response(&mut s).unwrap();
+            assert_eq!(res_type, 1);
+            conns.push(s);
+        }
+        assert_eq!(conns.len(), 64);
+
+        // 65th connection should be closed immediately by the server
+        let mut s65 = TcpStream::connect(&addr).expect("connect 65th");
+        s65.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let n = s65.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "65th connection must be dropped immediately due to capacity limit"
+        );
+
+        // Drop the 64 connections so capacity is released
+        drop(conns);
+        thread::sleep(Duration::from_millis(100));
+
+        // Now new connection succeeds
+        let mut fresh = TcpStream::connect(&addr).expect("connect after capacity release");
+        fresh
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        fresh.write_all(&encode_req(1, &[])).unwrap();
+        let (res_type, _) = read_response(&mut fresh).unwrap();
+        assert_eq!(res_type, 1, "PING succeeds after capacity is released");
     }
 }
 

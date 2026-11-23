@@ -20,6 +20,7 @@
   - `Version` からフレーム末尾までのバイト数（`2 + Payload.len()`）。
   - 有効範囲: **2 〜 4096** バイト（全体の電文長は 6 〜 4100 バイト）。
   - 確保前に検査し、範囲外（< 2 または > 4096）の場合は即座に接続を切断する。
+  - キー長（<= 512）や値長（<= 3072）が単体で上限内であっても、フレーム全体の長さが 4096 バイトを超える電文は不正長として即座に切断される。
 - **Version (8-bit unsigned)**:
   - プロトコル版。初版は `1` (0x01)。
   - `1` 以外は未対応版として接続を切断する。
@@ -34,15 +35,17 @@
 
 | 操作 | Type | 本文構造 | 説明 |
 |---|---|---|---|
-| `PING` | `0x01` (1) | なし（0 バイト） | 接続確認。応答は `OK`。 |
-| `GET` | `0x02` (2) | `key_len (u16 BE)` + `key (Bytes)` | キーの値を取得。応答は `VALUE`、`NOT_FOUND`、または `ERROR`。 |
-| `PUT` | `0x03` (3) | `key_len (u16 BE)` + `key (Bytes)` + `val_len (u16 BE)` + `val (Bytes)` + `ttl_tag (u8)` (+ `ttl_sec (i64 BE)`) | 値と期限を原子的に設定。応答は `OK` または `ERROR`。 |
-| `DELETE` | `0x04` (4) | `key_len (u16 BE)` + `key (Bytes)` | キーを失効・削除。応答は `OK` または `ERROR`。 |
+| `PING` | `0x01` (1) | なし（0 バイト） | 接続確認。応答は `Success`。 |
+| `GET` | `0x02` (2) | `key_len (u16 BE)` + `key (Bytes)` | キーの値を取得。応答は `Value`、`NotFound`、または `Error`。 |
+| `PUT` | `0x03` (3) | `key_len (u16 BE)` + `key (Bytes)` + `val_len (u16 BE)` + `val (Bytes)` + `ttl_tag (u8)` (+ `ttl_sec (i64 BE)`) | 値と期限を原子的に設定。応答は `Success` または `Error`。 |
+| `DELETE` | `0x04` (4) | `key_len (u16 BE)` + `key (Bytes)` | キーを失効・削除。応答は `Success` または `Error`。 |
 
 ### TTL の符号化
 - `ttl_tag = 0x00`: 期限なし（`NoExpiry`）。本文末尾に追加フィールドなし。
-- `ttl_tag = 0x01`: 秒数指定（`Seconds`）。続いて 8 バイトの符号付きビッグエンディアン整数 `ttl_sec` を配置。
-- それ以外の `ttl_tag` は引数誤り（`ERROR` コード 2: `InvalidPayload`）とする。
+- `ttl_tag = 0x01`: 秒数指定（`Seconds`）。続いて 8 バイトの符号付きビッグエンディアン整数 `ttl_sec` (i64 BE) を配置。
+- それ以外の `ttl_tag` は引数誤り（`Error` コード 2: `InvalidPayload`）とする。
+- `ttl_sec <= 0` は不正な TTL（`Error` コード 9: `InvalidTtl`）とする。
+- `ttl_sec` による期限計算があふれる場合は `Error` コード 10 (`DeadlineOverflow`) とする。
 
 ---
 
@@ -50,10 +53,10 @@
 
 | 結果 | Type | 本文構造 | 説明 |
 |---|---|---|---|
-| `OK` | `0x01` (1) | なし（0 バイト） | 操作成功（PING, PUT, DELETE）。 |
-| `VALUE` | `0x02` (2) | `val_len (u16 BE)` + `val (Bytes)` | GET 成功、値あり。 |
-| `NOT_FOUND` | `0x03` (3) | なし（0 バイト） | GET でキーが存在しない、または期限切れ。 |
-| `ERROR` | `0x04` (4) | `code (u8)` + `msg_len (u16 BE)` + `msg (Bytes)` | 型付きエラー。 |
+| `Success` | `0x01` (1) | なし（0 バイト） | 操作成功（PING, PUT, DELETE）。 |
+| `Value` | `0x02` (2) | `val_len (u16 BE)` + `val (Bytes)` | GET 成功、値あり。 |
+| `NotFound` | `0x03` (3) | なし（0 バイト） | GET でキーが存在しない、または期限切れ。 |
+| `Error` | `0x04` (4) | `code (u8)` + `msg_len (u16 BE)` + `msg (Bytes)` | 型付きエラー。 |
 
 ### エラーコード一覧
 | コード | 識別子 | 説明 |
@@ -64,14 +67,15 @@
 | 4 | `ValueLength` | 値長上限外（0〜3072 バイト外） |
 | 5 | `EncodedKeyLength` | 核のキー符号化後上限超過（> 1024 バイト） |
 | 6 | `EncodedRowLength` | 核の行符号化後上限超過（> 4096 バイト） |
-| 7 | `Capacity` | ストア容量上限到達 |
+| 7 | `Capacity` | ストア容量上限到達（新規キー追加不可） |
 | 8 | `TtlRequired` | TTL 必須モードで TTL なしの書き込み |
 | 9 | `InvalidTtl` | 不正な TTL（<= 0） |
 | 10 | `DeadlineOverflow` | 期限計算オーバーフロー |
 | 11 | `ClockUnavailable` | 時計取得失敗 |
 | 12 | `ClockRegressed` | 時計逆行検知 |
-| 13 | `Stopped` | ストア停止中（CommitUnknown 等） |
+| 13 | `Stopped` | 永続ストア停止中（CommitUnknown 等の障害復旧前） |
 | 14 | `Internal` | 内部エラー（DB エラー等） |
+| 15 | `InvalidCapacity` | 不正な容量指定（<= 0） |
 
 ---
 
@@ -84,8 +88,8 @@
 | 同時接続数 | 64 | 超過時は即時切断 |
 | 読み出しタイムアウト | 5000 ms | 接続切断 |
 | 書き込みタイムアウト | 5000 ms | 接続切断 |
-| キー長 | 1 〜 512 バイト | `ERROR(KeyLength)` 応答 |
-| 値長 | 0 〜 3072 バイト | `ERROR(ValueLength)` 応答 |
+| キー長 | 1 〜 512 バイト | `Error(KeyLength)` 応答 |
+| 値長 | 0 〜 3072 バイト | `Error(ValueLength)` 応答 |
 
 ---
 
@@ -100,7 +104,7 @@
 2. **エラー応答で継続する条件**:
    - 未知の操作種別（`UnknownOp`）
    - フレーム内の引数不正（`InvalidPayload`）
-   - ストア操作エラー（`KeyLength`, `Capacity`, `TtlRequired` 等）
+   - ストア操作エラー（`KeyLength`, `Capacity`, `TtlRequired`, `InvalidTtl`, `DeadlineOverflow` 等）
 3. **セキュリティ**:
    - 待ち受けは既定でループバック（`127.0.0.1`）。
    - キー・値・セッション ID はログや診断メッセージに出力しない。

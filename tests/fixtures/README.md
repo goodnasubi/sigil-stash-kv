@@ -4,14 +4,14 @@
 
 ## 正例 (Valid Fixtures)
 - `req_ping.bin`: PING 要求（長さ 2、版 1、Op 1）
-- `res_success.bin`: SUCCESS 応答（長さ 2、版 1、Result 1）
+- `res_success.bin`: Success 応答（長さ 2、版 1、Result 1）
 - `req_get.bin`: GET 要求（キー "abc"）
-- `res_value.bin`: VALUE 応答（値 "world"）
-- `res_not_found.bin`: NOT_FOUND 応答（キーなし）
+- `res_value.bin`: Value 応答（値 "world"）
+- `res_not_found.bin`: NotFound 応答（キーなし）
 - `req_put_no_ttl.bin`: PUT 要求（キー "k"、値 "v1"、期限なし `ttl_tag=0`）
 - `req_put_ttl.bin`: PUT 要求（キー "k"、値 "v1"、TTL 60秒 `ttl_tag=1`）
 - `req_delete.bin`: DELETE 要求（キー "abc"）
-- `res_error.bin`: ERROR 応答（エラーコード 3 `KeyLength`、メッセージ "bad"）
+- `res_error.bin`: Error 応答（エラーコード 3 `KeyLength`、メッセージ "bad"）
 - `req_max_frame.bin`: 最大許容フレーム長（4096 バイト）の PUT 要求境界値
 
 ## 負例 (Invalid Fixtures)

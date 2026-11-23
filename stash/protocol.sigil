@@ -39,7 +39,7 @@ pub fn kv_error_code(e: KvError) -> Int
     KvError.ValueLength => 4,
     KvError.EncodedKeyLength => 5,
     KvError.EncodedRowLength => 6,
-    KvError.InvalidCapacity => 2,
+    KvError.InvalidCapacity => 15,
     KvError.Capacity => 7,
     KvError.TtlRequired => 8,
     KvError.InvalidTtl => 9,
@@ -85,6 +85,9 @@ pub fn code_to_kv_error(code: Int) -> Option<KvError>
   if code == 12 {
     return Some(KvError.ClockRegressed);
   }
+  if code == 15 {
+    return Some(KvError.InvalidCapacity);
+  }
   return None;
 }
 
@@ -99,14 +102,17 @@ pub fn read_u16(data: &Bytes, offset: Int) -> Int
   return b0 * 256 + b1;
 }
 
-pub fn read_u64(data: &Bytes, offset: Int) -> Int
-  intent "Read a 64-bit big-endian non-negative integer from data."
+pub fn read_i64(data: &Bytes, offset: Int) -> Int
+  intent "Read a 64-bit big-endian signed integer from data."
   requires none
   ensures none
   effects none
 {
   let hi = data.read_u32_be(offset).unwrap_or(0);
   let lo = data.read_u32_be(offset + 4).unwrap_or(0);
+  if hi >= 2147483648 {
+    return (hi - 4294967296) * 4294967296 + lo;
+  }
   return hi * 4294967296 + lo;
 }
 
@@ -214,7 +220,7 @@ pub fn parse_request(payload: &Bytes) -> Result<Request, ProtoError>
       if len != pos2 + 1 + 8 {
         return Err(ProtoError.InvalidPayload);
       }
-      let sec = read_u64(&payload, pos2 + 1);
+      let sec = read_i64(&payload, pos2 + 1);
       return Ok(Request.Put(key, value, Ttl.Seconds(sec)));
     }
     return Err(ProtoError.InvalidPayload);
